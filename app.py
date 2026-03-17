@@ -29,7 +29,6 @@ def init_db():
     conn = db()
     cur = conn.cursor()
 
-    # users
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +37,6 @@ def init_db():
         )
     """)
 
-    # quiz_results
     cur.execute("""
         CREATE TABLE IF NOT EXISTS quiz_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +47,6 @@ def init_db():
         )
     """)
 
-    # phishing_logs
     cur.execute("""
         CREATE TABLE IF NOT EXISTS phishing_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,18 +60,10 @@ def init_db():
 
     conn.commit()
 
-    # ترقيات لو القاعدة قديمة
+    # ترقية جدول users لو كان قديم
     user_cols = [row[1] for row in cur.execute("PRAGMA table_info(users)").fetchall()]
     if "is_admin" not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-
-    quiz_cols = [row[1] for row in cur.execute("PRAGMA table_info(quiz_results)").fetchall()]
-    if "created_at" not in quiz_cols:
-        pass
-
-    phishing_cols = [row[1] for row in cur.execute("PRAGMA table_info(phishing_logs)").fetchall()]
-    if "created_at" not in phishing_cols:
-        pass
 
     conn.commit()
 
@@ -93,6 +82,10 @@ def init_db():
     conn.close()
 
 
+# مهم جدًا: هذا السطر لازم يكون هنا عشان Render يجهز القاعدة
+init_db()
+
+
 # =========================
 # بيانات المشروع
 # =========================
@@ -107,7 +100,7 @@ SCENARIOS = [
         "title": "تنبيه بنكي",
         "icon": "🏦",
         "desc": "رسالة تخبرك أن الحساب البنكي موقوف ويجب التحقق فورًا.",
-        "tip": "البنوك لا تطلب معلوماتك السرية عبر روابط ورسائل مجهولة."
+        "tip": "البنوك لا تطلب معلوماتك بهذه الطريقة."
     },
     {
         "title": "فزت بجائزة",
@@ -119,7 +112,7 @@ SCENARIOS = [
         "title": "رسالة واتساب",
         "icon": "📱",
         "desc": "شخص يطلب رمز التحقق أو معلومات شخصية من رقم غير معروف.",
-        "tip": "لا تُرسل رمز التحقق لأي شخص مهما كانت صفته."
+        "tip": "لا ترسل رمز التحقق لأي شخص."
     },
 ]
 
@@ -136,7 +129,7 @@ WIFI_NETWORKS = [
         "enc": "مفتوحة",
         "signal": 65,
         "risk": "خطرة",
-        "reason": "شبكة عامة وتُعد بيئة مناسبة للتصيد أو التنصت."
+        "reason": "شبكة عامة وتعد بيئة مناسبة للتصيد أو التنصت."
     },
     {
         "name": "Secure_Office_WiFi",
@@ -221,7 +214,7 @@ BOT_RESPONSES = {
     "كيف أحمي نفسي من التصيد؟": "تحقق من الرابط بدقة، ولا تدخل بياناتك إلا في المواقع الرسمية التي تصل إليها بنفسك.",
     "هل الواي فاي العام خطر؟": "نعم، خصوصًا إذا كان مفتوحًا. استخدم VPN وتجنب إدخال البيانات الحساسة.",
     "كيف أعرف كلمة المرور قوية؟": "الكلمة القوية تكون طويلة، فيها أحرف كبيرة وصغيرة وأرقام ورموز، ولا تحتوي نمطًا سهلًا.",
-    "ما هو التحقق الثنائي؟": "هو طبقة أمان إضافية تطلب رمزًا ثانيًا بعد كلمة المرور، مثل تطبيق مصادقة أو رسالة.",
+    "ما هو التحقق الثنائي؟": "هو طبقة أمان إضافية تطلب رمزًا ثانيًا بعد كلمة المرور.",
     "هل يمكن سرقة حسابي من صفحة مزيفة؟": "نعم، إذا أدخلت بياناتك في صفحة تصيد مزيفة يمكن سرقتها مباشرة."
 }
 
@@ -346,14 +339,13 @@ def get_user_level(username):
     ).fetchone()["total"]
     conn.close()
 
-    score = (quiz_count * 2) + phish_count
+    total_score = (quiz_count * 2) + phish_count
 
-    if score >= 8:
+    if total_score >= 8:
         return "متقدم"
-    elif score >= 4:
+    elif total_score >= 4:
         return "جيد"
-    else:
-        return "مبتدئ"
+    return "مبتدئ"
 
 
 def base_page(title, content, user=None):
@@ -397,7 +389,6 @@ def base_page(title, content, user=None):
         <style>
             :root {{
                 --bg:#071019;
-                --bg2:#0d1723;
                 --card:#101c2b;
                 --text:#ebf3ff;
                 --muted:#9cb1c9;
@@ -1640,5 +1631,4 @@ def chatbot():
 
 
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True)
