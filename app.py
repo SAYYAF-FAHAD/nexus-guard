@@ -2,7 +2,6 @@ from flask import Flask, request, redirect, session, url_for, render_template_st
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import sqlite3
-import random
 import re
 import urllib.parse
 import os
@@ -127,28 +126,76 @@ init_db()
 # =========================
 SCENARIOS = [
     {
+        "slug": "shipment",
         "title": "تتبع شحنتك",
         "icon": "📦",
         "desc": "رسالة تزعم وجود مشكلة في الشحنة وتطلب تحديث البيانات عبر رابط.",
-        "tip": "افتح الموقع الرسمي بنفسك ولا تدخل بياناتك من رابط مرسل."
+        "tip": "افتح الموقع الرسمي بنفسك ولا تدخل بياناتك من رابط مرسل.",
+        "details": "هذا السيناريو من أشهر حالات التصيد، حيث تصلك رسالة تخبرك أن شحنتك متوقفة أو تحتاج تحديث عنوانك. الهدف هو دفعك للضغط بسرعة وإدخال بياناتك.",
+        "signals": [
+            "وجود استعجال مبالغ فيه مثل: حدّث الآن فورًا",
+            "رابط غير واضح أو غير مطابق لاسم الجهة",
+            "طلب معلومات حساسة أو دفع رسوم بسيطة بسرعة",
+        ],
+        "safe_links": [
+            ("العودة للسيناريوهات", "/scenarios"),
+            ("الذهاب إلى صفحة الحماية", "/protection"),
+            ("افتح صفحة تجريبية توعوية", "/fake-bank")
+        ]
     },
     {
+        "slug": "bank",
         "title": "تنبيه بنكي",
         "icon": "🏦",
         "desc": "رسالة تخبرك أن الحساب البنكي موقوف ويجب التحقق فورًا.",
-        "tip": "البنوك لا تطلب معلوماتك بهذه الطريقة."
+        "tip": "البنوك لا تطلب معلوماتك بهذه الطريقة.",
+        "details": "في هذا النوع من الرسائل يتم تخويف المستخدم برسالة تقول إن الحساب موقوف أو أن هناك عملية مشبوهة. الهدف هو جعلك تدخل على صفحة مزيفة وتسلم بياناتك.",
+        "signals": [
+            "رسالة تخويف مفاجئة",
+            "طلب اسم المستخدم أو كلمة المرور أو رمز التحقق",
+            "رابط مشابه للبنك لكنه ليس رسميًا",
+        ],
+        "safe_links": [
+            ("العودة للسيناريوهات", "/scenarios"),
+            ("راجع صفحة الأمن السيبراني", "/cyber-info"),
+            ("راجع صفحة الحماية", "/protection")
+        ]
     },
     {
+        "slug": "prize",
         "title": "فزت بجائزة",
         "icon": "🎁",
         "desc": "إشعار وهمي يطلب معلوماتك الشخصية لاستلام الجائزة.",
-        "tip": "الجوائز المفاجئة من جهات مجهولة غالبًا احتيال."
+        "tip": "الجوائز المفاجئة من جهات مجهولة غالبًا احتيال.",
+        "details": "هذه الرسائل تعتمد على الطمع أو الحماس، وتطلب منك تعبئة نموذج أو دفع رسوم بسيطة أو إدخال بيانات حساسة من أجل استلام جائزة مزعومة.",
+        "signals": [
+            "جائزة لم تشارك أصلًا فيها",
+            "طلب معلومات حساسة للاستلام",
+            "رسوم غير منطقية أو طلب سريع جدًا",
+        ],
+        "safe_links": [
+            ("العودة للسيناريوهات", "/scenarios"),
+            ("اختبر وعيك الآن", "/quiz"),
+            ("راجع الحماية", "/protection")
+        ]
     },
     {
+        "slug": "whatsapp",
         "title": "رسالة واتساب",
         "icon": "📱",
         "desc": "شخص يطلب رمز التحقق أو معلومات شخصية من رقم غير معروف.",
-        "tip": "لا ترسل رمز التحقق لأي شخص."
+        "tip": "لا ترسل رمز التحقق لأي شخص.",
+        "details": "هذا السيناريو شائع جدًا، ويبدأ برسالة تبدو عادية من شخص يقول إنه أرسل لك رمزًا بالخطأ أو يحتاج رمز التفعيل. بمجرد مشاركته، قد يتم الاستيلاء على الحساب.",
+        "signals": [
+            "طلب رمز التحقق مباشرة",
+            "محادثة من رقم غير معروف",
+            "أسلوب استعطاف أو استعجال",
+        ],
+        "safe_links": [
+            ("العودة للسيناريوهات", "/scenarios"),
+            ("افتح الشات بوت", "/chatbot"),
+            ("راجع صفحة الحماية", "/protection")
+        ]
     },
 ]
 
@@ -338,6 +385,97 @@ def evaluate_password(password):
     }
 
 
+def evaluate_wifi_password(password, network_risk):
+    pwd = password.strip()
+    notes = []
+    score = 0
+
+    if not pwd:
+        return {
+            "level": "غير مدخلة",
+            "score": 0,
+            "color": "warning",
+            "notes": ["لم يتم إدخال كلمة مرور للتحليل."]
+        }
+
+    length = len(pwd)
+
+    if length <= 8:
+        notes.append("الطول بين 1-8 أحرف: هذا ضعيف جدًا غالبًا.")
+        score += 0
+    elif length <= 11:
+        notes.append("الطول متوسط لكنه ليس مثاليًا.")
+        score += 1
+    elif length <= 15:
+        notes.append("الطول جيد.")
+        score += 2
+    else:
+        notes.append("الطول ممتاز جدًا.")
+        score += 3
+
+    if re.search(r"[A-Z]", pwd):
+        score += 1
+        notes.append("تحتوي على أحرف كبيرة.")
+    else:
+        notes.append("يفضل إضافة أحرف كبيرة.")
+
+    if re.search(r"[a-z]", pwd):
+        score += 1
+        notes.append("تحتوي على أحرف صغيرة.")
+    else:
+        notes.append("يفضل إضافة أحرف صغيرة.")
+
+    if re.search(r"\d", pwd):
+        score += 1
+        notes.append("تحتوي على أرقام.")
+    else:
+        notes.append("يفضل إضافة أرقام.")
+
+    if re.search(r"[!@#$%^&*()_\-+=\[{\]};:'\",<.>/?\\|`~]", pwd):
+        score += 2
+        notes.append("تحتوي على رموز.")
+    else:
+        notes.append("يفضل إضافة رموز.")
+
+    lower_pwd = pwd.lower()
+    easy_patterns = ["123456", "12345678", "password", "admin", "wifi", "qwerty", "abcdefgh"]
+    if any(p in lower_pwd for p in easy_patterns):
+        score -= 2
+        notes.append("تحتوي على نمط سهل التخمين.")
+
+    if network_risk == "خطرة":
+        notes.append("الشبكة نفسها خطرة، لذلك حتى كلمة المرور الجيدة لا تجعل استخدامها مناسبًا للبيانات الحساسة.")
+    elif network_risk == "متوسطة":
+        notes.append("الشبكة متوسطة، احرص على كلمة مرور أقوى وتجنب الأنشطة الحساسة.")
+    elif network_risk == "آمنة":
+        notes.append("الشبكة آمنة نسبيًا، ومع كلمة مرور قوية يصبح الاستخدام أفضل.")
+
+    if score <= 2:
+        level = "ضعيفة"
+        color = "danger"
+    elif score <= 5:
+        level = "متوسطة"
+        color = "warning"
+    else:
+        level = "قوية"
+        color = "success"
+
+    return {
+        "level": level,
+        "score": max(score, 0),
+        "color": color,
+        "notes": notes
+    }
+
+
+def wifi_password_hint(network_risk):
+    if network_risk == "خطرة":
+        return "تلميح: إذا كانت كلمة المرور من 1 إلى 8 أحرف أو سهلة مثل 12345678 فهي ضعيفة جدًا، ومع ذلك يبقى خطر الشبكة مرتفعًا."
+    elif network_risk == "متوسطة":
+        return "تلميح: اجعل كلمة المرور أطول من 10 أحرف وتحتوي على حروف وأرقام ورموز."
+    return "تلميح: للشبكات الآمنة استخدم كلمة مرور قوية جدًا، طويلة، متنوعة، وفريدة للشبكة."
+
+
 def log_login_attempt(username, status):
     conn = db()
     conn.execute(
@@ -408,6 +546,13 @@ def get_user_level(username):
     elif total_score >= 4:
         return "جيد"
     return "مبتدئ"
+
+
+def find_scenario(slug):
+    for item in SCENARIOS:
+        if item["slug"] == slug:
+            return item
+    return None
 
 
 def base_page(title, content, user=None):
@@ -1053,8 +1198,8 @@ def dashboard():
 
     <section class="grid">
         <a class="card" href="/cyber-info"><h3>💻 الأمن السيبراني</h3><p>تعريفات ومفاهيم أساسية وأمثلة واقعية.</p></a>
-        <a class="card" href="/scenarios"><h3>🎭 السيناريوهات</h3><p>حالات تصيد واحتيال شائعة مع نصائح عملية.</p></a>
-        <a class="card" href="/wifi"><h3>📶 تحليل Wi-Fi</h3><p>اختر شبكة واعرف هل هي آمنة أو خطرة.</p></a>
+        <a class="card" href="/scenarios"><h3>🎭 السيناريوهات</h3><p>حالات تصيد واحتيال شائعة مع صفحات تفصيلية وروابط داخلية.</p></a>
+        <a class="card" href="/wifi"><h3>📶 تحليل Wi-Fi</h3><p>اختر شبكة واكتب كلمة المرور لتحصل على تحليل أشمل.</p></a>
         <a class="card" href="/protection"><h3>🛡️ الحماية</h3><p>نصائح أمنية وفاحص لقوة كلمة المرور.</p></a>
         <a class="card" href="/chatbot"><h3>🤖 الشات بوت</h3><p>مساعد توعوي يجيب عن الأسئلة الشائعة.</p></a>
         <a class="card" href="/quiz"><h3>📝 الاختبار</h3><p>اختبار من 10 أسئلة مع نتيجة نهائية.</p></a>
@@ -1333,23 +1478,72 @@ def scenarios():
             <h3>{item["icon"]} {item["title"]}</h3>
             <p>{item["desc"]}</p>
             <div class="tip">{item["tip"]}</div>
+            <div class="btns" style="margin-top:14px;">
+                <a class="btn btn-primary" href="/scenario/{item["slug"]}">عرض الصفحة</a>
+                <a class="btn btn-secondary" href="/protection">الحماية</a>
+            </div>
         </div>
         """
 
     content = f"""
     <section class="panel">
         <h2>🎭 سيناريوهات احتيال شائعة</h2>
-        <p class="sub">هذه الحالات تحاكي أكثر أنواع الخداع انتشارًا في الحياة الرقمية.</p>
+        <p class="sub">هذه الحالات تحاكي أكثر أنواع الخداع انتشارًا في الحياة الرقمية، وكل سيناريو له صفحة تفصيلية وروابط داخلية.</p>
         <div class="grid">{cards}</div>
     </section>
     """
     return render_template_string(base_page("السيناريوهات", content, session["user"]))
 
 
-@app.route("/wifi")
+@app.route("/scenario/<slug>")
+@login_required
+def scenario_page(slug):
+    item = find_scenario(slug)
+    if not item:
+        return redirect(url_for("scenarios"))
+
+    image = svg_data_uri(item["icon"], item["title"], "#00e0ff", "#00ff9c")
+
+    signals_html = "".join([f"<li>{s}</li>" for s in item["signals"]])
+
+    links_html = ""
+    for text, href in item["safe_links"]:
+        links_html += f'<a class="btn btn-primary" href="{href}">{text}</a>'
+
+    content = f"""
+    <section class="panel hero">
+        <div>
+            <div class="title">{item["icon"]} {item["title"]}</div>
+            <div class="sub">{item["details"]}</div>
+            <div class="tip">{item["tip"]}</div>
+            <div class="btns" style="margin-top:14px;">
+                {links_html}
+            </div>
+        </div>
+        <div>
+            <img class="image-card" src="{image}" alt="{item["title"]}">
+        </div>
+    </section>
+
+    <section class="panel">
+        <h3>علامات الخطر</h3>
+        <ul class="list">{signals_html}</ul>
+    </section>
+
+    <section class="panel">
+        <h3>التصرف الصحيح</h3>
+        <div class="msg success">
+            التصرف الصحيح هو عدم الاستعجال، وعدم إدخال أي بيانات حساسة، وفتح الجهة الرسمية بنفسك بدل الضغط على أي رابط مشبوه.
+        </div>
+    </section>
+    """
+    return render_template_string(base_page(item["title"], content, session["user"]))
+
+
+@app.route("/wifi", methods=["GET", "POST"])
 @login_required
 def wifi():
-    selected_name = request.args.get("name", "")
+    selected_name = request.values.get("name", "")
     selected = None
     for item in WIFI_NETWORKS:
         if item["name"] == selected_name:
@@ -1371,6 +1565,8 @@ def wifi():
         """
 
     analysis = ""
+    password_section = ""
+
     if selected:
         bclass = badge_class_from_risk(selected["risk"])
         note = (
@@ -1380,6 +1576,36 @@ def wifi():
             if selected["risk"] == "متوسطة"
             else "هذه الشبكة غير مناسبة لإدخال كلمات المرور أو البيانات البنكية."
         )
+
+        entered_password = request.form.get("wifi_password", "") if request.method == "POST" else ""
+        password_result_html = ""
+        if entered_password:
+            result = evaluate_wifi_password(entered_password, selected["risk"])
+            notes_html = "".join([f"<li>{n}</li>" for n in result["notes"]])
+            password_result_html = f"""
+            <section class="panel">
+                <h3>تحليل كلمة مرور الشبكة</h3>
+                <p class="sub"><strong>التقييم:</strong> <span class="badge {result["color"]}">{result["level"]}</span></p>
+                <p class="sub"><strong>الدرجة:</strong> {result["score"]}</p>
+                <ul class="list">{notes_html}</ul>
+            </section>
+            """
+
+        password_section = f"""
+        <section class="panel">
+            <h3>فحص كلمة مرور الشبكة</h3>
+            <p class="sub">{wifi_password_hint(selected["risk"])}</p>
+            <form method="POST">
+                <input type="hidden" name="name" value="{selected["name"]}">
+                <div class="field">
+                    <input type="text" name="wifi_password" placeholder="اكتب كلمة مرور الشبكة لتحليلها" value="{entered_password}">
+                </div>
+                <button class="btn btn-primary" type="submit">تحليل كلمة المرور</button>
+            </form>
+        </section>
+        {password_result_html}
+        """
+
         analysis = f"""
         <section class="panel">
             <h3>نتيجة التحليل: {selected["name"]}</h3>
@@ -1394,10 +1620,11 @@ def wifi():
     content = f"""
     <section class="panel">
         <h2>📶 تحليل الشبكات اللاسلكية</h2>
-        <p class="sub">اختر أي شبكة لعرض حالة الأمان والتحليل التوعوي الخاص بها.</p>
+        <p class="sub">اختر أي شبكة لعرض حالة الأمان، ثم اكتب كلمة المرور لتحصل على تحليل إضافي لقوتها.</p>
         <div class="grid">{cards}</div>
     </section>
     {analysis}
+    {password_section}
     """
     return render_template_string(base_page("تحليل Wi-Fi", content, session["user"]))
 
