@@ -5,11 +5,12 @@ import sqlite3
 import random
 import re
 import urllib.parse
+import os
 
 app = Flask(__name__)
-app.secret_key = "nexus_guard_secret_key_2026"
+app.secret_key = os.getenv("SECRET_KEY", "nexus_guard_secret_key_2026")
 
-DB_NAME = "nexus_guard.db"
+DB_NAME = os.getenv("DB_NAME", "nexus_guard.db")
 PROJECT_NAME = "Nexus Guard"
 
 ADMIN_USERNAME = "sayyaf"
@@ -33,7 +34,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
+            password_hash TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login_at TIMESTAMP,
+            login_count INTEGER DEFAULT 0
         )
     """)
 
@@ -58,22 +63,54 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS login_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            status TEXT NOT NULL,
+            user_agent TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
 
-    # ترقية جدول users لو كان قديم
     user_cols = [row[1] for row in cur.execute("PRAGMA table_info(users)").fetchall()]
+
     if "is_admin" not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
 
+    if "created_at" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+    if "last_login_at" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP")
+
+    if "login_count" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0")
+
     conn.commit()
 
-    # إنشاء الأدمن أو ترقيته
     cur.execute("SELECT * FROM users WHERE username = ?", (ADMIN_USERNAME,))
     admin = cur.fetchone()
+
     if not admin:
         cur.execute(
             "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)",
             (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD), 1)
+        )
+        cur.execute(
+            "INSERT INTO admin_logs (admin_username, action) VALUES (?, ?)",
+            (ADMIN_USERNAME, "تم إنشاء حساب الأدمن الأساسي")
         )
     else:
         cur.execute("UPDATE users SET is_admin = 1 WHERE username = ?", (ADMIN_USERNAME,))
@@ -82,7 +119,6 @@ def init_db():
     conn.close()
 
 
-# مهم جدًا: هذا السطر لازم يكون هنا عشان Render يجهز القاعدة
 init_db()
 
 
@@ -300,6 +336,32 @@ def evaluate_password(password):
         "notes": notes,
         "color": color
     }
+
+
+def log_login_attempt(username, status):
+    conn = db()
+    conn.execute(
+        "INSERT INTO login_logs (username, status, user_agent) VALUES (?, ?, ?)",
+        (
+            username if username else "غير معروف",
+            status,
+            request.headers.get("User-Agent", "Unknown")
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_admin_action(action):
+    if "user" not in session or not session.get("is_admin"):
+        return
+    conn = db()
+    conn.execute(
+        "INSERT INTO admin_logs (admin_username, action) VALUES (?, ?)",
+        (session["user"], action)
+    )
+    conn.commit()
+    conn.close()
 
 
 def svg_data_uri(icon, title, color1="#00e0ff", color2="#00ff9c"):
@@ -818,13 +880,25 @@ def login():
 
         conn = db()
         user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-        conn.close()
 
         if user and check_password_hash(user["password_hash"], password):
             session["user"] = username
             session["is_admin"] = bool(user["is_admin"])
+
+            conn.execute("""
+                UPDATE users
+                SET last_login_at = CURRENT_TIMESTAMP,
+                    login_count = COALESCE(login_count, 0) + 1
+                WHERE username = ?
+            """, (username,))
+            conn.commit()
+            conn.close()
+
+            log_login_attempt(username, "نجاح")
             return redirect(url_for("dashboard"))
         else:
+            conn.close()
+            log_login_attempt(username, "فشل")
             message = '<div class="msg danger">بيانات الدخول غير صحيحة.</div>'
 
     content = f"""
@@ -922,6 +996,10 @@ def dashboard():
         "SELECT COUNT(*) AS total FROM phishing_logs WHERE username = ?",
         (username,)
     ).fetchone()["total"]
+    user_row = conn.execute(
+        "SELECT created_at, last_login_at, login_count FROM users WHERE username = ?",
+        (username,)
+    ).fetchone()
     conn.close()
 
     latest_result_html = ""
@@ -964,8 +1042,12 @@ def dashboard():
             <p>{phish_count}</p>
         </div>
         <div class="card">
-            <h3>الوصول السريع</h3>
-            <p>ابدأ من مختبر التجارب أو اختبار الوعي السيبراني.</p>
+            <h3>عدد مرات الدخول</h3>
+            <p>{user_row["login_count"] or 0}</p>
+        </div>
+        <div class="card">
+            <h3>آخر دخول</h3>
+            <p>{user_row["last_login_at"] or "أول دخول"}</p>
         </div>
     </section>
 
@@ -991,12 +1073,13 @@ def admin_panel():
     users_count = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
     quiz_count = conn.execute("SELECT COUNT(*) AS total FROM quiz_results").fetchone()["total"]
     phishing_count = conn.execute("SELECT COUNT(*) AS total FROM phishing_logs").fetchone()["total"]
+    login_logs_count = conn.execute("SELECT COUNT(*) AS total FROM login_logs").fetchone()["total"]
 
     latest_users = conn.execute("""
-        SELECT id, username, is_admin
+        SELECT id, username, is_admin, created_at, last_login_at, login_count
         FROM users
         ORDER BY id DESC
-        LIMIT 10
+        LIMIT 20
     """).fetchall()
 
     quiz_results = conn.execute("""
@@ -1013,6 +1096,20 @@ def admin_panel():
         LIMIT 20
     """).fetchall()
 
+    login_rows = conn.execute("""
+        SELECT id, username, status, user_agent, created_at
+        FROM login_logs
+        ORDER BY id DESC
+        LIMIT 30
+    """).fetchall()
+
+    admin_rows = conn.execute("""
+        SELECT id, admin_username, action, created_at
+        FROM admin_logs
+        ORDER BY id DESC
+        LIMIT 30
+    """).fetchall()
+
     conn.close()
 
     users_rows = ""
@@ -1023,6 +1120,9 @@ def admin_panel():
             <td>{row["id"]}</td>
             <td>{row["username"]}</td>
             <td>{role}</td>
+            <td>{row["created_at"] or "-"}</td>
+            <td>{row["last_login_at"] or "-"}</td>
+            <td>{row["login_count"] or 0}</td>
         </tr>
         """
 
@@ -1044,9 +1144,32 @@ def admin_panel():
         <tr>
             <td>{row["id"]}</td>
             <td>{row["username"]}</td>
-            <td>{row["fake_username"]}</td>
+            <td>{row["fake_username"] or "-"}</td>
             <td>{row["password_strength"]}</td>
             <td>{row["risk_level"]}</td>
+            <td>{row["created_at"]}</td>
+        </tr>
+        """
+
+    login_table = ""
+    for row in login_rows:
+        login_table += f"""
+        <tr>
+            <td>{row["id"]}</td>
+            <td>{row["username"]}</td>
+            <td>{row["status"]}</td>
+            <td>{row["user_agent"] or "-"}</td>
+            <td>{row["created_at"]}</td>
+        </tr>
+        """
+
+    admin_table = ""
+    for row in admin_rows:
+        admin_table += f"""
+        <tr>
+            <td>{row["id"]}</td>
+            <td>{row["admin_username"]}</td>
+            <td>{row["action"]}</td>
             <td>{row["created_at"]}</td>
         </tr>
         """
@@ -1054,13 +1177,14 @@ def admin_panel():
     content = f"""
     <section class="panel">
         <h2>👑 لوحة الأدمن</h2>
-        <p class="sub">هذه الصفحة مخصصة للإدارة فقط وتعرض نظرة شاملة على المستخدمين والنتائج والتجارب.</p>
+        <p class="sub">هذه الصفحة مخصصة للإدارة فقط وتعرض نظرة شاملة على المستخدمين والسجلات والنتائج.</p>
     </section>
 
     <section class="grid">
         <div class="card"><h3>عدد المستخدمين</h3><p>{users_count}</p></div>
         <div class="card"><h3>عدد نتائج الاختبار</h3><p>{quiz_count}</p></div>
         <div class="card"><h3>عدد تجارب التصيد</h3><p>{phishing_count}</p></div>
+        <div class="card"><h3>سجل محاولات الدخول</h3><p>{login_logs_count}</p></div>
     </section>
 
     <section class="panel">
@@ -1068,10 +1192,45 @@ def admin_panel():
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr><th>#</th><th>اسم المستخدم</th><th>النوع</th></tr>
+                    <tr>
+                        <th>#</th>
+                        <th>اسم المستخدم</th>
+                        <th>النوع</th>
+                        <th>تاريخ الإنشاء</th>
+                        <th>آخر دخول</th>
+                        <th>عدد مرات الدخول</th>
+                    </tr>
                 </thead>
                 <tbody>
-                    {users_rows if users_rows else '<tr><td colspan="3">لا يوجد مستخدمون</td></tr>'}
+                    {users_rows if users_rows else '<tr><td colspan="6">لا يوجد مستخدمون</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h3>سجل الدخول</h3>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>#</th><th>اسم المستخدم</th><th>الحالة</th><th>الجهاز</th><th>التاريخ</th></tr>
+                </thead>
+                <tbody>
+                    {login_table if login_table else '<tr><td colspan="5">لا توجد سجلات دخول</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h3>سجل عمليات الأدمن</h3>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>#</th><th>الأدمن</th><th>العملية</th><th>التاريخ</th></tr>
+                </thead>
+                <tbody>
+                    {admin_table if admin_table else '<tr><td colspan="4">لا توجد عمليات</td></tr>'}
                 </tbody>
             </table>
         </div>
@@ -1247,7 +1406,7 @@ def wifi():
 @login_required
 def hacker():
     simulation = """
-[+] CYBER EXPERIENCE LAB READY...
+[+] CYBER AWARENESS LAB READY...
 [+] WAITING FOR USER INPUT...
 [+] أدخل بيانات المحاكاة لرؤية النتيجة التوعوية
     """.strip()
@@ -1259,17 +1418,13 @@ def hacker():
         fake_password = request.form.get("fake_password", "").strip()
 
         if fake_username and fake_password:
-            fake_ip = f"192.168.{random.randint(10, 250)}.{random.randint(2, 250)}"
-            port = random.choice([21, 22, 80, 443, 8080])
             strength = evaluate_password(fake_password)
 
             simulation = f"""
 [+] STARTING EDUCATIONAL EXPERIENCE...
-[+] TARGET FORM DETECTED
-[+] USERNAME CAPTURED: {fake_username}
-[+] PASSWORD CAPTURED: {fake_password}
-[+] SOURCE IP: {fake_ip}
-[+] OPEN PORT DETECTED: {port}
+[+] TRAINING FORM DETECTED
+[+] ENTERED USERNAME: {fake_username}
+[+] PASSWORD ENTERED: [HIDDEN FOR SAFETY]
 [+] PASSWORD STRENGTH: {strength["level"]}
 [!] WARNING: إدخال البيانات في صفحة مزيفة قد يعرّض الحساب للسرقة
 [✔] EXPERIENCE FINISHED
@@ -1282,7 +1437,7 @@ def hacker():
                 <p class="sub"><strong>اسم المستخدم المدخل:</strong> {fake_username}</p>
                 <p class="sub"><strong>قوة كلمة المرور:</strong> {strength["level"]}</p>
                 <ul class="list">{notes}</ul>
-                <div class="msg danger">هذه تجربة تعليمية فقط، لكنها توضح كيف يمكن لصفحات التصيد أن تجمع بياناتك.</div>
+                <div class="msg danger">هذه تجربة تعليمية فقط، لكنها توضح كيف يمكن لصفحات التصيد أن تجمع بياناتك إذا أدخلتها في موقع غير موثوق.</div>
             </section>
             """
 
@@ -1296,7 +1451,7 @@ def hacker():
 
     <section class="hero">
         <div class="panel" style="margin-bottom:0;">
-            <h3>🎣 نموذج تصيد مزيف</h3>
+            <h3>🎣 نموذج توعوي مشابه للتصيد</h3>
             <form method="POST" style="margin-top:16px;">
                 <div class="field"><input type="text" name="fake_username" placeholder="اسم المستخدم" required></div>
                 <div class="field"><input type="password" name="fake_password" placeholder="كلمة المرور" required></div>
@@ -1326,7 +1481,7 @@ def fake_bank():
         fake_pass = request.form.get("password", "").strip()
 
         session["last_fake_user"] = fake_user
-        session["last_fake_pass"] = fake_pass
+        session["last_password_strength"] = evaluate_password(fake_pass)["level"]
 
         strength = evaluate_password(fake_pass)
         conn = db()
@@ -1376,15 +1531,7 @@ def fake_bank():
 @login_required
 def phishing_result():
     fake_user = session.get("last_fake_user", "غير معروف")
-    fake_pass = session.get("last_fake_pass", "")
-
-    strength = evaluate_password(fake_pass) if fake_pass else {
-        "level": "غير معروف",
-        "score": 0,
-        "notes": []
-    }
-
-    notes_html = "".join([f"<li>{note}</li>" for note in strength["notes"]]) if fake_pass else "<li>لا توجد بيانات.</li>"
+    strength_level = session.get("last_password_strength", "غير معروف")
 
     content = f"""
     <section class="panel">
@@ -1402,12 +1549,12 @@ def phishing_result():
             <h3>البيانات التي أدخلتها</h3>
             <p><strong>اسم المستخدم:</strong> {fake_user}</p>
             <p><strong>تم إدخال كلمة مرور:</strong> نعم</p>
+            <p><strong>الكلمة المعروضة:</strong> مخفية للحماية</p>
         </div>
 
         <div class="card">
             <h3>تحليل كلمة المرور</h3>
-            <p><strong>التقييم:</strong> {strength["level"]}</p>
-            <p><strong>الدرجة:</strong> {strength["score"]}</p>
+            <p><strong>التقييم:</strong> {strength_level}</p>
         </div>
     </section>
 
@@ -1419,11 +1566,6 @@ def phishing_result():
             <li>الجهات الرسمية لا تطلب معلوماتك بهذه الطريقة.</li>
             <li>يجب فتح الموقع الرسمي يدويًا بدل الضغط على الروابط.</li>
         </ul>
-    </section>
-
-    <section class="panel">
-        <h3>تفصيل تقييم كلمة المرور</h3>
-        <ul class="list">{notes_html}</ul>
     </section>
 
     <section class="panel">
