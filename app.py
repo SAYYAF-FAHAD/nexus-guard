@@ -1,10 +1,11 @@
-from flask import Flask, request, redirect, session, url_for, render_template_string
+from flask import Flask, request, redirect, session, url_for, render_template_string, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 import sqlite3
-import re
-import urllib.parse
 import os
+import random
+import re
+from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "nexus_guard_secret_key_2026")
@@ -16,9 +17,9 @@ ADMIN_USERNAME = "sayyaf"
 ADMIN_PASSWORD = "P@ssw0rd"
 
 
-# =========================
+# =========================================================
 # قاعدة البيانات
-# =========================
+# =========================================================
 def db():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -35,1838 +36,1071 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             is_admin INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login_at TIMESTAMP,
-            login_count INTEGER DEFAULT 0
+            failed_attempts INTEGER DEFAULT 0,
+            locked INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS quiz_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            score INTEGER NOT NULL,
-            total INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER,
+            score INTEGER,
+            total INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS phishing_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
+            user_id INTEGER,
             fake_username TEXT,
             password_strength TEXT,
             risk_level TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS login_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            status TEXT NOT NULL,
+            username TEXT,
+            success INTEGER,
+            ip_address TEXT,
             user_agent TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS admin_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_username TEXT NOT NULL,
-            action TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.commit()
-
-    user_cols = [row[1] for row in cur.execute("PRAGMA table_info(users)").fetchall()]
-
-    if "is_admin" not in user_cols:
-        cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-
-    if "created_at" not in user_cols:
-        cur.execute("ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-
-    if "last_login_at" not in user_cols:
-        cur.execute("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP")
-
-    if "login_count" not in user_cols:
-        cur.execute("ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0")
-
-    conn.commit()
-
+    # إنشاء حساب الأدمن إذا غير موجود
     cur.execute("SELECT * FROM users WHERE username = ?", (ADMIN_USERNAME,))
     admin = cur.fetchone()
-
     if not admin:
-        cur.execute(
-            "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)",
-            (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD), 1)
-        )
-        cur.execute(
-            "INSERT INTO admin_logs (admin_username, action) VALUES (?, ?)",
-            (ADMIN_USERNAME, "تم إنشاء حساب الأدمن الأساسي")
-        )
-    else:
-        cur.execute("UPDATE users SET is_admin = 1 WHERE username = ?", (ADMIN_USERNAME,))
+        cur.execute("""
+            INSERT INTO users (username, password_hash, is_admin)
+            VALUES (?, ?, 1)
+        """, (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD)))
 
     conn.commit()
     conn.close()
 
 
-init_db()
+# =========================================================
+# أدوات مساعدة
+# =========================================================
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
+            flash("يجب تسجيل الدخول أولاً", "warning")
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
 
 
-# =========================
-# بيانات المشروع
-# =========================
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session or not session.get("is_admin"):
+            flash("غير مصرح لك بالدخول", "danger")
+            return redirect(url_for("dashboard"))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def get_ip():
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "Unknown"
+
+
+def get_user():
+    if "user_id" not in session:
+        return None
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],))
+    user = cur.fetchone()
+    conn.close()
+    return user
+
+
+def count_user_quizzes(user_id):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as c FROM quiz_results WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+
+def count_user_phishing(user_id):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as c FROM phishing_logs WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+
+def get_user_level(user_id):
+    quizzes = count_user_quizzes(user_id)
+    phishing = count_user_phishing(user_id)
+    score = quizzes + phishing
+
+    if score >= 8:
+        return "متقدم"
+    elif score >= 4:
+        return "جيد"
+    return "مبتدئ"
+
+
+def analyze_password_strength(password):
+    score = 0
+    notes = []
+
+    if len(password) >= 8:
+        score += 1
+    else:
+        notes.append("يفضل أن تكون 8 أحرف أو أكثر")
+
+    if len(password) >= 12:
+        score += 1
+
+    if re.search(r"[A-Z]", password):
+        score += 1
+    else:
+        notes.append("أضف حرفًا كبيرًا")
+
+    if re.search(r"[a-z]", password):
+        score += 1
+    else:
+        notes.append("أضف حرفًا صغيرًا")
+
+    if re.search(r"\d", password):
+        score += 1
+    else:
+        notes.append("أضف أرقامًا")
+
+    if re.search(r"[^\w]", password):
+        score += 1
+    else:
+        notes.append("أضف رمزًا خاصًا")
+
+    weak_patterns = ["123", "password", "qwerty", "admin", "111", "000", "abc"]
+    lowered = password.lower()
+    for p in weak_patterns:
+        if p in lowered:
+            score -= 1
+            notes.append(f"يحتوي على نمط ضعيف: {p}")
+            break
+
+    if score <= 2:
+        return {"level": "ضعيفة", "score": max(score, 0), "color": "#ff4d4d", "notes": notes}
+    elif score <= 4:
+        return {"level": "متوسطة", "score": score, "color": "#ffcc00", "notes": notes}
+    else:
+        return {"level": "قوية", "score": score, "color": "#00ff88", "notes": notes}
+
+
+def cyber_tip():
+    tips = [
+        "لا تضغط أي رابط مجهول قبل التأكد من المصدر.",
+        "فعّل التحقق بخطوتين لحساباتك المهمة.",
+        "لا تستخدم نفس كلمة المرور في كل المواقع.",
+        "شبكات Wi-Fi المفتوحة قد تعرّض بياناتك للخطر.",
+        "الرسائل المستعجلة والمخيفة غالبًا تكون تصيدًا.",
+        "حدّث نظامك وبرامجك باستمرار.",
+        "لا تشارك رمز التحقق مع أي شخص.",
+        "تأكد من كتابة اسم الموقع الصحيح قبل تسجيل الدخول."
+    ]
+    return random.choice(tips)
+
+
 SCENARIOS = [
     {
-        "slug": "shipment",
-        "title": "تتبع شحنتك",
-        "icon": "📦",
-        "desc": "رسالة تزعم وجود مشكلة في الشحنة وتطلب تحديث البيانات عبر رابط.",
-        "tip": "افتح الموقع الرسمي بنفسك ولا تدخل بياناتك من رابط مرسل.",
-        "details": "هذا السيناريو من أشهر حالات التصيد، حيث تصلك رسالة تخبرك أن شحنتك متوقفة أو تحتاج تحديث عنوانك. الهدف هو دفعك للضغط بسرعة وإدخال بياناتك.",
-        "signals": [
-            "وجود استعجال مبالغ فيه مثل: حدّث الآن فورًا",
-            "رابط غير واضح أو غير مطابق لاسم الجهة",
-            "طلب معلومات حساسة أو دفع رسوم بسيطة بسرعة",
-        ],
-        "safe_links": [
-            ("العودة للسيناريوهات", "/scenarios"),
-            ("الذهاب إلى صفحة الحماية", "/protection"),
-            ("افتح صفحة تجريبية توعوية", "/fake-bank")
-        ]
+        "title": "📦 تتبع شحنتك",
+        "desc": "وصلتك رسالة تقول إن شحنتك متوقفة ويجب الضغط فورًا على الرابط.",
+        "risk": "غالبًا تصيد",
+        "tip": "ادخل على موقع شركة الشحن الرسمي بنفسك ولا تضغط الرابط مباشرة."
     },
     {
-        "slug": "bank",
-        "title": "تنبيه بنكي",
-        "icon": "🏦",
-        "desc": "رسالة تخبرك أن الحساب البنكي موقوف ويجب التحقق فورًا.",
-        "tip": "البنوك لا تطلب معلوماتك بهذه الطريقة.",
-        "details": "في هذا النوع من الرسائل يتم تخويف المستخدم برسالة تقول إن الحساب موقوف أو أن هناك عملية مشبوهة. الهدف هو جعلك تدخل على صفحة مزيفة وتسلم بياناتك.",
-        "signals": [
-            "رسالة تخويف مفاجئة",
-            "طلب اسم المستخدم أو كلمة المرور أو رمز التحقق",
-            "رابط مشابه للبنك لكنه ليس رسميًا",
-        ],
-        "safe_links": [
-            ("العودة للسيناريوهات", "/scenarios"),
-            ("راجع صفحة الأمن السيبراني", "/cyber-info"),
-            ("راجع صفحة الحماية", "/protection")
-        ]
+        "title": "🏦 تنبيه بنكي",
+        "desc": "رسالة تقول: تم إيقاف حسابك البنكي مؤقتًا، حدّث بياناتك الآن.",
+        "risk": "خطر مرتفع",
+        "tip": "البنك لا يطلب بياناتك السرية عبر الروابط العشوائية."
     },
     {
-        "slug": "prize",
-        "title": "فزت بجائزة",
-        "icon": "🎁",
-        "desc": "إشعار وهمي يطلب معلوماتك الشخصية لاستلام الجائزة.",
-        "tip": "الجوائز المفاجئة من جهات مجهولة غالبًا احتيال.",
-        "details": "هذه الرسائل تعتمد على الطمع أو الحماس، وتطلب منك تعبئة نموذج أو دفع رسوم بسيطة أو إدخال بيانات حساسة من أجل استلام جائزة مزعومة.",
-        "signals": [
-            "جائزة لم تشارك أصلًا فيها",
-            "طلب معلومات حساسة للاستلام",
-            "رسوم غير منطقية أو طلب سريع جدًا",
-        ],
-        "safe_links": [
-            ("العودة للسيناريوهات", "/scenarios"),
-            ("اختبر وعيك الآن", "/quiz"),
-            ("راجع الحماية", "/protection")
-        ]
+        "title": "🎁 فزت بجائزة",
+        "desc": "مبروك! ربحت هاتفًا جديدًا، أدخل معلوماتك للاستلام.",
+        "risk": "احتيال",
+        "tip": "العروض المبالغ فيها غالبًا هدفها سرقة البيانات."
     },
     {
-        "slug": "whatsapp",
-        "title": "رسالة واتساب",
-        "icon": "📱",
-        "desc": "شخص يطلب رمز التحقق أو معلومات شخصية من رقم غير معروف.",
-        "tip": "لا ترسل رمز التحقق لأي شخص.",
-        "details": "هذا السيناريو شائع جدًا، ويبدأ برسالة تبدو عادية من شخص يقول إنه أرسل لك رمزًا بالخطأ أو يحتاج رمز التفعيل. بمجرد مشاركته، قد يتم الاستيلاء على الحساب.",
-        "signals": [
-            "طلب رمز التحقق مباشرة",
-            "محادثة من رقم غير معروف",
-            "أسلوب استعطاف أو استعجال",
-        ],
-        "safe_links": [
-            ("العودة للسيناريوهات", "/scenarios"),
-            ("افتح الشات بوت", "/chatbot"),
-            ("راجع صفحة الحماية", "/protection")
-        ]
-    },
+        "title": "📱 رسالة واتساب",
+        "desc": "تم إرسال ملف أو صورة لك، سجّل دخولك للمشاهدة.",
+        "risk": "رابط مزيف",
+        "tip": "تحقق من عنوان الموقع، ولا تسجل دخولك إلا في الصفحة الرسمية."
+    }
 ]
 
 WIFI_NETWORKS = [
     {
         "name": "Free_Coffee_WiFi",
-        "enc": "مفتوحة",
-        "signal": 78,
+        "security": "Open",
+        "signal": "قوي",
         "risk": "خطرة",
-        "reason": "شبكة مفتوحة بدون تشفير ويمكن اعتراض البيانات خلالها."
+        "reason": "شبكة مفتوحة بدون تشفير، يمكن اعتراض البيانات."
     },
     {
         "name": "Airport_FreeNet",
-        "enc": "مفتوحة",
-        "signal": 65,
+        "security": "Open",
+        "signal": "متوسط",
         "risk": "خطرة",
-        "reason": "شبكة عامة وتعد بيئة مناسبة للتصيد أو التنصت."
+        "reason": "الشبكات العامة المفتوحة مكان شائع للتصيد والتجسس."
     },
     {
         "name": "Secure_Office_WiFi",
-        "enc": "WPA2/WPA3",
-        "signal": 92,
+        "security": "WPA2/WPA3",
+        "signal": "قوي",
         "risk": "آمنة",
-        "reason": "تشفير جيد وبيئة أكثر موثوقية."
+        "reason": "تستخدم بروتوكول تشفير جيد."
     },
     {
         "name": "Cafe_Staff_Private",
-        "enc": "WPA2",
-        "signal": 83,
+        "security": "WPA2",
+        "signal": "جيد",
         "risk": "متوسطة",
-        "reason": "أفضل من المفتوحة لكن يلزم استخدام كلمة مرور قوية والحذر."
-    },
+        "reason": "أفضل من المفتوحة، لكن يجب التأكد من اسم الشبكة الصحيح."
+    }
 ]
 
 QUIZ_QUESTIONS = [
     {
-        "question": "هل الشبكات العامة المفتوحة مناسبة لإدخال البيانات البنكية؟",
-        "options": ["نعم", "لا", "أحيانًا"],
+        "q": "ما أفضل تصرف عند وصول رسالة تطلب منك تحديث كلمة المرور عبر رابط مجهول؟",
+        "choices": ["أضغط الرابط فورًا", "أتجاهل التحقق", "أدخل الموقع الرسمي يدويًا", "أرسل بياناتي للمرسل"],
+        "answer": "أدخل الموقع الرسمي يدويًا",
+        "explain": "الطريقة الآمنة هي الدخول للموقع الرسمي بنفسك بدل الضغط على روابط مجهولة."
+    },
+    {
+        "q": "ما فائدة التحقق بخطوتين؟",
+        "choices": ["يزيد الأمان", "يقلل سرعة الإنترنت", "يحذف الفيروسات", "يغني عن كلمة المرور"],
+        "answer": "يزيد الأمان",
+        "explain": "حتى لو عرف المهاجم كلمة المرور يبقى بحاجة لخطوة إضافية."
+    },
+    {
+        "q": "أي كلمة مرور أقوى؟",
+        "choices": ["12345678", "password", "Sayyaf2026!", "abcd1234"],
+        "answer": "Sayyaf2026!",
+        "explain": "لأنها تحتوي على أحرف كبيرة وصغيرة وأرقام ورمز."
+    },
+    {
+        "q": "ما خطورة Wi-Fi المفتوح؟",
+        "choices": ["أسرع دائمًا", "لا يوجد خطر", "قد يسمح باعتراض البيانات", "يحميك من التصيد"],
+        "answer": "قد يسمح باعتراض البيانات",
+        "explain": "الشبكات المفتوحة تجعل بياناتك أكثر عرضة للاعتراض."
+    },
+    {
+        "q": "أي علامة تدل على التصيد؟",
+        "choices": ["استعجال وتهديد", "اسم نطاق معروف وصحيح", "شهادة موثوقة من جهة معروفة", "دخول عبر التطبيق الرسمي"],
+        "answer": "استعجال وتهديد",
+        "explain": "المحتال غالبًا يستخدم التخويف أو الاستعجال لدفعك للضغط بسرعة."
+    },
+    {
+        "q": "هل يجوز مشاركة رمز التحقق مع موظف يدّعي الدعم الفني؟",
+        "choices": ["نعم", "لا", "أحيانًا", "إذا كان مستعجل"],
         "answer": "لا",
-        "explanation": "الشبكات العامة قد تكون غير آمنة لاعتراض البيانات."
-    },
-    {
-        "question": "ما الأفضل لحماية الحساب؟",
-        "options": ["كلمة مرور فقط", "التحقق الثنائي", "نفس كلمة المرور بكل المواقع"],
-        "answer": "التحقق الثنائي",
-        "explanation": "التحقق الثنائي يضيف طبقة أمان إضافية قوية."
-    },
-    {
-        "question": "إذا وصلك رابط يطلب تحديث بياناتك من جهة مجهولة، ماذا تفعل؟",
-        "options": ["أضغط فورًا", "أتجاهله وأتحقق من الجهة الرسمية", "أرسل بياناتي"],
-        "answer": "أتجاهله وأتحقق من الجهة الرسمية",
-        "explanation": "هذا الأسلوب شائع في التصيد الاحتيالي."
-    },
-    {
-        "question": "هل مشاركة رمز التحقق مع الآخرين آمنة؟",
-        "options": ["نعم", "لا", "إذا كان صديقًا فقط"],
-        "answer": "لا",
-        "explanation": "رمز التحقق سري جدًا ويمنح وصولًا مباشرًا للحساب."
-    },
-    {
-        "question": "أي كلمة مرور أقوى؟",
-        "options": ["12345678", "sayyaf2026", "P@ssw0rd!92#X"],
-        "answer": "P@ssw0rd!92#X",
-        "explanation": "القوة ترتفع مع الطول والتنوع والرموز."
-    },
-    {
-        "question": "ما الهدف الشائع من رسائل الجوائز الوهمية؟",
-        "options": ["الترفيه", "سرقة البيانات", "التوعية"],
-        "answer": "سرقة البيانات",
-        "explanation": "الهدف غالبًا إغراء الضحية لسرقة معلوماته."
-    },
-    {
-        "question": "هل تحديث النظام والبرامج مهم أمنيًا؟",
-        "options": ["نعم", "لا", "فقط إذا بطأ الجهاز"],
-        "answer": "نعم",
-        "explanation": "التحديثات قد تسد ثغرات أمنية مهمة."
-    },
-    {
-        "question": "ما المقصود بالتصيد الاحتيالي؟",
-        "options": ["حماية الشبكة", "خداع المستخدم لسرقة معلوماته", "تسريع الإنترنت"],
-        "answer": "خداع المستخدم لسرقة معلوماته",
-        "explanation": "التصيد يعتمد على استدراج الضحية لصفحة أو رسالة مزيفة."
-    },
-    {
-        "question": "أي تصرف أفضل عند استخدام Wi-Fi عام؟",
-        "options": ["فتح الحساب البنكي", "استخدام VPN وتجنب البيانات الحساسة", "تعطيل الحماية"],
-        "answer": "استخدام VPN وتجنب البيانات الحساسة",
-        "explanation": "هذا يقلل من المخاطر في الشبكات العامة."
-    },
-    {
-        "question": "هل يجب استخدام نفس كلمة المرور لكل الحسابات؟",
-        "options": ["نعم", "لا", "إذا كانت قوية فقط"],
-        "answer": "لا",
-        "explanation": "تكرار كلمة المرور يضاعف الخطر عند تسريبها."
+        "explain": "رموز التحقق سرية ولا يجب مشاركتها مع أي أحد."
     }
 ]
 
-BOT_RESPONSES = {
-    "كيف أحمي نفسي من التصيد؟": "تحقق من الرابط بدقة، ولا تدخل بياناتك إلا في المواقع الرسمية التي تصل إليها بنفسك.",
-    "هل الواي فاي العام خطر؟": "نعم، خصوصًا إذا كان مفتوحًا. استخدم VPN وتجنب إدخال البيانات الحساسة.",
-    "كيف أعرف كلمة المرور قوية؟": "الكلمة القوية تكون طويلة، فيها أحرف كبيرة وصغيرة وأرقام ورموز، ولا تحتوي نمطًا سهلًا.",
-    "ما هو التحقق الثنائي؟": "هو طبقة أمان إضافية تطلب رمزًا ثانيًا بعد كلمة المرور.",
-    "هل يمكن سرقة حسابي من صفحة مزيفة؟": "نعم، إذا أدخلت بياناتك في صفحة تصيد مزيفة يمكن سرقتها مباشرة."
+CHATBOT_KNOWLEDGE = {
+    "ما هو الأمن السيبراني": "الأمن السيبراني هو حماية الأجهزة والأنظمة والشبكات والبيانات من الاختراق أو التخريب أو الوصول غير المصرح به.",
+    "ما هو التصيد": "التصيد هو محاولة خداع الضحية برسالة أو موقع مزيف للحصول على بياناته مثل كلمة المرور أو رقم البطاقة.",
+    "ما هي فائدة التحقق بخطوتين": "التحقق بخطوتين يضيف طبقة أمان إضافية فوق كلمة المرور ويصعّب اختراق الحساب.",
+    "كيف أعرف الرابط المزيف": "افحص اسم النطاق جيدًا، وانتبه للأخطاء الإملائية والروابط المختصرة والرسائل المستعجلة.",
+    "ما خطر الواي فاي المفتوح": "الشبكات المفتوحة قد تسمح للمهاجمين بمراقبة التصفح أو اعتراض البيانات.",
+    "كيف أحمي حسابي": "استخدم كلمة مرور قوية ومختلفة وفعّل التحقق بخطوتين ولا تضغط الروابط المشبوهة.",
+    "ما هي كلمة المرور القوية": "هي كلمة طويلة وتحتوي على أحرف كبيرة وصغيرة وأرقام ورموز ولا تتضمن معلومات سهلة التخمين.",
+    "هل كل رسالة بنك صحيحة": "لا، بعض الرسائل تنتحل اسم البنك. الأفضل الدخول لتطبيق البنك أو موقعه الرسمي مباشرة.",
+    "ما هو الهندسة الاجتماعية": "هي أسلوب خداع نفسي يستغل الثقة أو الخوف أو الاستعجال للحصول على معلومات حساسة.",
+    "ما أفضل طريقة للتأكد من الموقع": "اكتب رابط الموقع يدويًا أو استخدم التطبيق الرسمي بدل الاعتماد على الروابط المرسلة.",
 }
 
 
-# =========================
-# أدوات مساعدة
-# =========================
-def login_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if "user" not in session:
-            return redirect(url_for("login"))
-        return func(*args, **kwargs)
-    return wrapper
-
-
-def admin_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if "user" not in session:
-            return redirect(url_for("login"))
-        if not session.get("is_admin"):
-            return redirect(url_for("dashboard"))
-        return func(*args, **kwargs)
-    return wrapper
-
-
-def evaluate_password(password):
-    score = 0
-    notes = []
-
-    if len(password) >= 12:
-        score += 2
-        notes.append("الطول ممتاز")
-    elif len(password) >= 8:
-        score += 1
-        notes.append("الطول جيد")
-    else:
-        notes.append("قصيرة")
-
-    if re.search(r"[A-Z]", password):
-        score += 1
-        notes.append("تحتوي على أحرف كبيرة")
-    else:
-        notes.append("لا تحتوي على أحرف كبيرة")
-
-    if re.search(r"[a-z]", password):
-        score += 1
-        notes.append("تحتوي على أحرف صغيرة")
-    else:
-        notes.append("لا تحتوي على أحرف صغيرة")
-
-    if re.search(r"\d", password):
-        score += 1
-        notes.append("تحتوي على أرقام")
-    else:
-        notes.append("لا تحتوي على أرقام")
-
-    if re.search(r"[!@#$%^&*()_\-+=\[{\]};:'\",<.>/?\\|`~]", password):
-        score += 2
-        notes.append("تحتوي على رموز")
-    else:
-        notes.append("لا تحتوي على رموز")
-
-    weak_patterns = ["123", "password", "qwerty", "sayyaf", "admin"]
-    if any(p in password.lower() for p in weak_patterns):
-        score -= 2
-        notes.append("تحتوي على نمط سهل التخمين")
-
-    if score <= 2:
-        level = "ضعيفة"
-        color = "danger"
-    elif score <= 5:
-        level = "متوسطة"
-        color = "warning"
-    else:
-        level = "قوية"
-        color = "success"
-
-    return {
-        "level": level,
-        "score": max(score, 0),
-        "notes": notes,
-        "color": color
-    }
-
-
-def evaluate_wifi_password(password, network_risk):
-    pwd = password.strip()
-    notes = []
-    score = 0
-
-    if not pwd:
-        return {
-            "level": "غير مدخلة",
-            "score": 0,
-            "color": "warning",
-            "notes": ["لم يتم إدخال كلمة مرور للتحليل."]
+# =========================================================
+# القالب الأساسي
+# =========================================================
+BASE_HTML = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - {{ project_name }}</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: Tahoma, Arial, sans-serif;
+            background:
+                radial-gradient(circle at top right, rgba(0,255,65,0.08), transparent 25%),
+                linear-gradient(135deg, #050505, #0b1220, #08110a);
+            color: #e5ffe9;
+            min-height: 100vh;
         }
-
-    length = len(pwd)
-
-    if length <= 8:
-        notes.append("الطول بين 1-8 أحرف: هذا ضعيف جدًا غالبًا.")
-        score += 0
-    elif length <= 11:
-        notes.append("الطول متوسط لكنه ليس مثاليًا.")
-        score += 1
-    elif length <= 15:
-        notes.append("الطول جيد.")
-        score += 2
-    else:
-        notes.append("الطول ممتاز جدًا.")
-        score += 3
-
-    if re.search(r"[A-Z]", pwd):
-        score += 1
-        notes.append("تحتوي على أحرف كبيرة.")
-    else:
-        notes.append("يفضل إضافة أحرف كبيرة.")
-
-    if re.search(r"[a-z]", pwd):
-        score += 1
-        notes.append("تحتوي على أحرف صغيرة.")
-    else:
-        notes.append("يفضل إضافة أحرف صغيرة.")
-
-    if re.search(r"\d", pwd):
-        score += 1
-        notes.append("تحتوي على أرقام.")
-    else:
-        notes.append("يفضل إضافة أرقام.")
-
-    if re.search(r"[!@#$%^&*()_\-+=\[{\]};:'\",<.>/?\\|`~]", pwd):
-        score += 2
-        notes.append("تحتوي على رموز.")
-    else:
-        notes.append("يفضل إضافة رموز.")
-
-    lower_pwd = pwd.lower()
-    easy_patterns = ["123456", "12345678", "password", "admin", "wifi", "qwerty", "abcdefgh"]
-    if any(p in lower_pwd for p in easy_patterns):
-        score -= 2
-        notes.append("تحتوي على نمط سهل التخمين.")
-
-    if network_risk == "خطرة":
-        notes.append("الشبكة نفسها خطرة، لذلك حتى كلمة المرور الجيدة لا تجعل استخدامها مناسبًا للبيانات الحساسة.")
-    elif network_risk == "متوسطة":
-        notes.append("الشبكة متوسطة، احرص على كلمة مرور أقوى وتجنب الأنشطة الحساسة.")
-    elif network_risk == "آمنة":
-        notes.append("الشبكة آمنة نسبيًا، ومع كلمة مرور قوية يصبح الاستخدام أفضل.")
-
-    if score <= 2:
-        level = "ضعيفة"
-        color = "danger"
-    elif score <= 5:
-        level = "متوسطة"
-        color = "warning"
-    else:
-        level = "قوية"
-        color = "success"
-
-    return {
-        "level": level,
-        "score": max(score, 0),
-        "color": color,
-        "notes": notes
-    }
-
-
-def wifi_password_hint(network_risk):
-    if network_risk == "خطرة":
-        return "تلميح: إذا كانت كلمة المرور من 1 إلى 8 أحرف أو سهلة مثل 12345678 فهي ضعيفة جدًا، ومع ذلك يبقى خطر الشبكة مرتفعًا."
-    elif network_risk == "متوسطة":
-        return "تلميح: اجعل كلمة المرور أطول من 10 أحرف وتحتوي على حروف وأرقام ورموز."
-    return "تلميح: للشبكات الآمنة استخدم كلمة مرور قوية جدًا، طويلة، متنوعة، وفريدة للشبكة."
-
-
-def log_login_attempt(username, status):
-    conn = db()
-    conn.execute(
-        "INSERT INTO login_logs (username, status, user_agent) VALUES (?, ?, ?)",
-        (
-            username if username else "غير معروف",
-            status,
-            request.headers.get("User-Agent", "Unknown")
-        )
-    )
-    conn.commit()
-    conn.close()
-
-
-def log_admin_action(action):
-    if "user" not in session or not session.get("is_admin"):
-        return
-    conn = db()
-    conn.execute(
-        "INSERT INTO admin_logs (admin_username, action) VALUES (?, ?)",
-        (session["user"], action)
-    )
-    conn.commit()
-    conn.close()
-
-
-def svg_data_uri(icon, title, color1="#00e0ff", color2="#00ff9c"):
-    svg = f"""
-    <svg xmlns='http://www.w3.org/2000/svg' width='900' height='360'>
-      <defs>
-        <linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>
-          <stop offset='0%' stop-color='{color1}'/>
-          <stop offset='100%' stop-color='{color2}'/>
-        </linearGradient>
-      </defs>
-      <rect width='100%' height='100%' fill='#071019'/>
-      <rect x='20' y='20' rx='28' ry='28' width='860' height='320' fill='url(#g)' opacity='0.14'/>
-      <circle cx='760' cy='95' r='70' fill='url(#g)' opacity='0.25'/>
-      <circle cx='130' cy='250' r='90' fill='url(#g)' opacity='0.20'/>
-      <text x='80' y='170' font-size='90' fill='white'>{icon}</text>
-      <text x='190' y='160' font-size='42' font-family='Arial' fill='white'>{title}</text>
-      <text x='190' y='215' font-size='22' font-family='Arial' fill='#dcefff'>Nexus Guard</text>
-    </svg>
-    """
-    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
-
-
-def badge_class_from_risk(risk):
-    return "success" if risk == "آمنة" else "warning" if risk == "متوسطة" else "danger"
-
-
-def get_user_level(username):
-    conn = db()
-    quiz_count = conn.execute(
-        "SELECT COUNT(*) AS total FROM quiz_results WHERE username = ?",
-        (username,)
-    ).fetchone()["total"]
-    phish_count = conn.execute(
-        "SELECT COUNT(*) AS total FROM phishing_logs WHERE username = ?",
-        (username,)
-    ).fetchone()["total"]
-    conn.close()
-
-    total_score = (quiz_count * 2) + phish_count
-
-    if total_score >= 8:
-        return "متقدم"
-    elif total_score >= 4:
-        return "جيد"
-    return "مبتدئ"
-
-
-def find_scenario(slug):
-    for item in SCENARIOS:
-        if item["slug"] == slug:
-            return item
-    return None
-
-
-def base_page(title, content, user=None):
-    admin_link = ""
-    if session.get("is_admin"):
-        admin_link = '<a href="/admin">لوحة الأدمن</a>'
-
-    nav = ""
-    if user:
-        nav = f"""
-        <nav class="navbar">
-            <div class="brand">
-                <div class="logo">N</div>
-                <div>
-                    <div class="brand-title">{PROJECT_NAME}</div>
-                    <div class="brand-sub">منصة تفاعلية للتوعية بالأمن السيبراني</div>
-                </div>
-            </div>
-            <div class="links">
-                <a href="/dashboard">الرئيسية</a>
-                <a href="/cyber-info">الأمن السيبراني</a>
-                <a href="/scenarios">السيناريوهات</a>
-                <a href="/wifi">تحليل Wi-Fi</a>
-                <a href="/hacker">مختبر التجارب</a>
-                <a href="/protection">الحماية</a>
-                <a href="/quiz">الاختبار</a>
-                <a href="/chatbot">الشات بوت</a>
-                {admin_link}
-                <a class="logout" href="/logout">تسجيل الخروج</a>
-            </div>
-        </nav>
-        """
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="ar" dir="rtl">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>{title}</title>
-        <style>
-            :root {{
-                --bg:#071019;
-                --card:#101c2b;
-                --text:#ebf3ff;
-                --muted:#9cb1c9;
-                --primary:#00e0ff;
-                --secondary:#00ff9c;
-                --danger:#ff4d6d;
-                --warning:#ffb703;
-                --success:#39d98a;
-                --border:rgba(255,255,255,.08);
-            }}
-            * {{
-                box-sizing:border-box;
-                margin:0;
-                padding:0;
-            }}
-            body {{
-                font-family:Tahoma, Arial, sans-serif;
-                background:linear-gradient(135deg, var(--bg), #050b12 45%, #0b1320);
-                color:var(--text);
-                min-height:100vh;
-            }}
-            .bg {{
-                position:fixed;
-                inset:0;
-                background-image:
-                    linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
-                    linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
-                background-size:26px 26px;
-                pointer-events:none;
-                z-index:0;
-            }}
-            .navbar {{
-                display:flex;
-                justify-content:space-between;
-                align-items:center;
-                gap:20px;
-                padding:14px 22px;
-                background:rgba(7,16,25,.92);
-                border-bottom:1px solid var(--border);
-                position:sticky;
-                top:0;
-                z-index:20;
-                flex-wrap:wrap;
-                backdrop-filter: blur(10px);
-            }}
-            .brand {{
-                display:flex;
-                align-items:center;
-                gap:12px;
-            }}
-            .logo {{
-                width:50px;
-                height:50px;
-                display:grid;
-                place-items:center;
-                border-radius:16px;
-                background:linear-gradient(135deg, var(--primary), var(--secondary));
-                color:#031016;
-                font-size:28px;
-                font-weight:bold;
-                box-shadow:0 0 20px rgba(0,224,255,.35);
-            }}
-            .brand-title {{
-                font-size:20px;
-                font-weight:bold;
-            }}
-            .brand-sub {{
-                color:var(--muted);
-                font-size:13px;
-            }}
-            .links {{
-                display:flex;
-                gap:10px;
-                flex-wrap:wrap;
-            }}
-            .links a {{
-                text-decoration:none;
-                color:var(--text);
-                border:1px solid var(--border);
-                padding:10px 14px;
-                border-radius:12px;
-                background:rgba(255,255,255,.02);
-                transition:.2s;
-            }}
-            .links a:hover {{
-                border-color:rgba(0,224,255,.45);
-                transform:translateY(-2px);
-            }}
-            .logout {{
-                border-color:rgba(255,77,109,.35) !important;
-            }}
-            .wrap {{
-                max-width:1250px;
-                margin:auto;
-                padding:24px;
-                position:relative;
-                z-index:2;
-            }}
-            .panel {{
-                background:linear-gradient(180deg, rgba(16,28,43,.92), rgba(9,17,27,.95));
-                border:1px solid var(--border);
-                border-radius:22px;
-                padding:24px;
-                margin-bottom:22px;
-                box-shadow:0 10px 35px rgba(0,0,0,.28);
-            }}
-            .hero {{
-                display:grid;
-                grid-template-columns:1.2fr 1fr;
-                gap:20px;
-                align-items:center;
-            }}
-            .title {{
-                font-size:34px;
-                margin-bottom:14px;
-                line-height:1.5;
-            }}
-            .sub {{
-                color:var(--muted);
-                line-height:1.9;
-                margin-bottom:18px;
-            }}
-            .btns {{
-                display:flex;
-                gap:10px;
-                flex-wrap:wrap;
-            }}
-            .btn {{
-                display:inline-block;
-                text-decoration:none;
-                border:none;
-                cursor:pointer;
-                padding:12px 18px;
-                border-radius:14px;
-                font-weight:bold;
-                transition:.2s;
-            }}
-            .btn:hover {{
-                transform:translateY(-2px);
-            }}
-            .btn-primary {{
-                background:linear-gradient(135deg, var(--primary), #1cc7ff);
-                color:#071019;
-            }}
-            .btn-secondary {{
-                background:linear-gradient(135deg, var(--secondary), #38f2b3);
-                color:#071019;
-            }}
-            .btn-danger {{
-                background:linear-gradient(135deg, var(--danger), #ff7591);
-                color:#fff;
-            }}
-            .terminal {{
-                background:#03080d;
-                border:1px solid rgba(0,255,156,.18);
-                border-radius:20px;
-                overflow:hidden;
-                box-shadow:0 0 25px rgba(0,255,156,.08);
-            }}
-            .terminal-head {{
-                display:flex;
-                gap:8px;
-                padding:14px 16px;
-                background:#07111a;
-                border-bottom:1px solid rgba(255,255,255,.06);
-            }}
-            .terminal-head span {{
-                width:12px;
-                height:12px;
-                border-radius:50%;
-            }}
-            .terminal-head span:nth-child(1) {{ background:#ff5f57; }}
-            .terminal-head span:nth-child(2) {{ background:#febc2e; }}
-            .terminal-head span:nth-child(3) {{ background:#28c840; }}
-            .terminal-body {{
-                min-height:280px;
-                padding:22px;
-                color:#46ff9d;
-                font-family:Consolas, monospace;
-                white-space:pre-wrap;
-                line-height:1.8;
-            }}
-            .grid {{
-                display:grid;
-                grid-template-columns:repeat(auto-fit, minmax(240px, 1fr));
-                gap:16px;
-            }}
-            .card {{
-                background:linear-gradient(180deg, rgba(16,28,43,.92), rgba(9,17,27,.95));
-                border:1px solid var(--border);
-                border-radius:18px;
-                padding:20px;
-                text-decoration:none;
-                color:var(--text);
-                transition:.2s;
-            }}
-            .card:hover {{
-                transform:translateY(-4px);
-                border-color:rgba(0,224,255,.35);
-            }}
-            .card p {{
-                color:var(--muted);
-                margin-top:8px;
-                line-height:1.8;
-            }}
-            .auth {{
-                min-height:80vh;
-                display:grid;
-                place-items:center;
-                padding:20px;
-            }}
-            .auth-card {{
-                width:min(100%, 470px);
-                background:linear-gradient(180deg, rgba(16,28,43,.95), rgba(9,17,27,.92));
-                border:1px solid var(--border);
-                border-radius:24px;
-                padding:30px;
-                box-shadow:0 0 30px rgba(0,255,156,.08);
-            }}
-            .auth-title {{
-                font-size:32px;
-                margin-bottom:10px;
-            }}
-            .auth-sub {{
-                color:var(--muted);
-                margin-bottom:20px;
-            }}
-            .field {{
-                margin-bottom:12px;
-            }}
-            input, select {{
-                width:100%;
-                padding:14px 16px;
-                border-radius:14px;
-                border:1px solid var(--border);
-                background:#08131f;
-                color:var(--text);
-                outline:none;
-            }}
-            .msg {{
-                padding:14px 16px;
-                border-radius:14px;
-                margin-bottom:14px;
-                border:1px solid var(--border);
-            }}
-            .success {{ color:#d6ffeb; border-color:rgba(57,217,138,.4); background:rgba(57,217,138,.08); }}
-            .warning {{ color:#fff1bf; border-color:rgba(255,183,3,.45); background:rgba(255,183,3,.08); }}
-            .danger {{ color:#ffd8e0; border-color:rgba(255,77,109,.45); background:rgba(255,77,109,.08); }}
-            .muted {{ color:var(--muted); }}
-            .tip {{
-                margin-top:12px;
-                padding:12px 14px;
-                border-radius:14px;
-                background:rgba(0,224,255,.08);
-                border:1px solid rgba(0,224,255,.16);
-                color:#dff8ff;
-            }}
-            .badge {{
-                display:inline-block;
-                padding:8px 12px;
-                border-radius:999px;
-                font-size:13px;
-                margin-top:10px;
-            }}
-            .badge.success {{ background:rgba(57,217,138,.12); color:#bcffe1; }}
-            .badge.warning {{ background:rgba(255,183,3,.12); color:#ffeab0; }}
-            .badge.danger {{ background:rgba(255,77,109,.12); color:#ffd4dc; }}
-            .list {{
-                padding-right:18px;
-                line-height:1.9;
-                color:var(--muted);
-            }}
-            .question {{
-                border:1px solid var(--border);
-                border-radius:18px;
-                padding:18px;
-                margin-bottom:16px;
-                background:rgba(255,255,255,.03);
-            }}
-            .question h3 {{
-                margin-bottom:14px;
-            }}
-            .option {{
-                display:block;
-                margin-bottom:10px;
-                padding:12px 14px;
-                border:1px solid var(--border);
-                border-radius:12px;
-                cursor:pointer;
-            }}
-            .score {{
-                font-size:36px;
-                color:var(--secondary);
-                margin:10px 0 14px;
-            }}
-            .chat-box {{
-                min-height:280px;
-                max-height:420px;
-                overflow:auto;
-                border:1px solid var(--border);
-                border-radius:18px;
-                padding:16px;
-                background:#07131f;
-                margin-bottom:14px;
-            }}
-            .chat-msg {{
-                padding:12px 14px;
-                border-radius:14px;
-                margin-bottom:10px;
-                line-height:1.8;
-            }}
-            .bot {{
-                background:rgba(0,224,255,.09);
-                border:1px solid rgba(0,224,255,.15);
-            }}
-            .user {{
-                background:rgba(57,217,138,.12);
-                border:1px solid rgba(57,217,138,.2);
-            }}
-            .inline {{
-                display:flex;
-                gap:10px;
-                flex-wrap:wrap;
-            }}
-            .inline input {{
-                flex:1;
-            }}
-            .small {{
-                font-size:13px;
-                color:var(--muted);
-            }}
-            .table-wrap {{
-                overflow:auto;
-                margin-top:16px;
-            }}
-            table {{
-                width:100%;
-                border-collapse:collapse;
-            }}
-            th, td {{
-                padding:12px;
-                text-align:right;
-                border-bottom:1px solid var(--border);
-            }}
-            th {{
-                color:#00e0ff;
-            }}
-            .image-card {{
-                width:100%;
-                height:180px;
-                object-fit:cover;
-                border-radius:16px;
-                border:1px solid var(--border);
-                margin-bottom:14px;
-                background:#09131d;
-            }}
-            .footer {{
-                margin-top:50px;
-                padding:25px 20px;
-                border-top:1px solid rgba(255,255,255,.08);
-                text-align:center;
-                background:linear-gradient(180deg, rgba(0,0,0,0), rgba(0,224,255,0.03));
-            }}
-            .footer-content {{
-                max-width:700px;
-                margin:auto;
-            }}
-            .footer-title {{
-                font-size:20px;
-                font-weight:bold;
-                color:#00e0ff;
-                margin-bottom:10px;
-                letter-spacing:1px;
-            }}
-            .footer-text {{
-                font-size:14px;
-                color:#9cb1c9;
-                line-height:1.9;
-                margin-bottom:12px;
-            }}
-            .footer-copy {{
-                font-size:12px;
-                color:#6b7f99;
-                opacity:0.8;
-            }}
-            @media (max-width: 900px) {{
-                .hero {{
-                    grid-template-columns:1fr;
-                }}
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="bg"></div>
-        {nav}
-        <div class="wrap">
-            {content}
-            <footer class="footer">
-                <div class="footer-content">
-                    <div class="footer-title">Nexus Guard</div>
-                    <div class="footer-text">
-                        تم تطوير هذه المنصة بعناية على يد سياف اليزيدي، ضمن مشروع تقني متقدم
-                        يهدف إلى تعزيز الوعي بالأمن السيبراني من خلال تجارب تفاعلية واقعية.
-                    </div>
-                    <div class="footer-copy">
-                        © 2026 جميع الحقوق محفوظة — سياف اليزيدي
-                    </div>
-                </div>
-            </footer>
+        a { text-decoration: none; color: inherit; }
+        .nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            background: rgba(0,0,0,0.45);
+            border-bottom: 1px solid rgba(0,255,65,0.22);
+            position: sticky;
+            top: 0;
+            backdrop-filter: blur(10px);
+            z-index: 99;
+        }
+        .brand {
+            font-size: 24px;
+            font-weight: bold;
+            color: #00ff88;
+            text-shadow: 0 0 12px rgba(0,255,136,0.35);
+        }
+        .nav-links {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .nav-links a {
+            padding: 10px 14px;
+            border: 1px solid rgba(0,255,65,0.25);
+            border-radius: 12px;
+            background: rgba(255,255,255,0.03);
+            transition: 0.25s;
+            font-size: 14px;
+        }
+        .nav-links a:hover {
+            background: rgba(0,255,65,0.12);
+            transform: translateY(-1px);
+        }
+        .container {
+            max-width: 1200px;
+            margin: 24px auto;
+            padding: 0 18px 40px;
+        }
+        .hero {
+            background: linear-gradient(135deg, rgba(0,255,136,0.10), rgba(0,224,255,0.08));
+            border: 1px solid rgba(0,255,136,0.25);
+            border-radius: 22px;
+            padding: 28px;
+            box-shadow: 0 0 30px rgba(0,0,0,0.18);
+            margin-bottom: 20px;
+        }
+        .hero h1 {
+            margin: 0 0 10px;
+            color: #00ff88;
+            font-size: 30px;
+        }
+        .hero p {
+            margin: 6px 0;
+            color: #d6fbe0;
+            line-height: 1.8;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 16px;
+        }
+        .card {
+            background: rgba(0,0,0,0.35);
+            border: 1px solid rgba(0,255,65,0.18);
+            border-radius: 18px;
+            padding: 18px;
+            box-shadow: 0 0 18px rgba(0,0,0,0.12);
+        }
+        .card h3 {
+            margin-top: 0;
+            color: #00ff88;
+        }
+        .btn {
+            display: inline-block;
+            background: linear-gradient(135deg, #00ff88, #00d4ff);
+            color: #03140a;
+            border: none;
+            border-radius: 12px;
+            padding: 11px 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: 0.25s;
+        }
+        .btn:hover {
+            transform: translateY(-1px);
+            opacity: 0.95;
+        }
+        .btn-secondary {
+            background: rgba(255,255,255,0.08);
+            color: #eaffef;
+            border: 1px solid rgba(0,255,65,0.20);
+        }
+        input, select, textarea {
+            width: 100%;
+            padding: 12px 13px;
+            margin: 8px 0 14px;
+            border-radius: 12px;
+            border: 1px solid rgba(0,255,65,0.20);
+            background: rgba(255,255,255,0.04);
+            color: #ffffff;
+            outline: none;
+        }
+        textarea { min-height: 120px; resize: vertical; }
+        label { display: block; margin-top: 10px; color: #d9ffe2; }
+        .flash {
+            padding: 12px 14px;
+            margin: 10px 0;
+            border-radius: 12px;
+            font-size: 14px;
+        }
+        .success { background: rgba(0,255,136,0.12); border: 1px solid rgba(0,255,136,0.35); }
+        .danger { background: rgba(255,77,77,0.12); border: 1px solid rgba(255,77,77,0.35); }
+        .warning { background: rgba(255,204,0,0.12); border: 1px solid rgba(255,204,0,0.35); color: #fff5c2; }
+        .info { background: rgba(0,212,255,0.12); border: 1px solid rgba(0,212,255,0.35); }
+        .terminal {
+            background: #020202;
+            border: 1px solid rgba(0,255,65,0.30);
+            border-radius: 16px;
+            padding: 16px;
+            color: #00ff88;
+            font-family: Consolas, monospace;
+            white-space: pre-wrap;
+            line-height: 1.8;
+            box-shadow: inset 0 0 30px rgba(0,255,65,0.05);
+        }
+        .badge {
+            display: inline-block;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: bold;
+            margin-left: 6px;
+        }
+        .safe { background: rgba(0,255,136,0.15); color: #8fffc0; border: 1px solid rgba(0,255,136,0.25); }
+        .medium { background: rgba(255,204,0,0.12); color: #ffe68a; border: 1px solid rgba(255,204,0,0.25); }
+        .danger-badge { background: rgba(255,77,77,0.14); color: #ff9f9f; border: 1px solid rgba(255,77,77,0.28); }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            overflow: hidden;
+            border-radius: 14px;
+        }
+        th, td {
+            padding: 12px;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+            text-align: right;
+            vertical-align: top;
+        }
+        th { color: #00ff88; background: rgba(255,255,255,0.04); }
+        .footer {
+            text-align: center;
+            padding: 30px 20px;
+            color: #b5cdb8;
+            opacity: 0.85;
+            font-size: 14px;
+        }
+        .muted {
+            color: #bfd7c4;
+            font-size: 14px;
+        }
+        .split {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 16px;
+        }
+        .phone-frame {
+            border: 8px solid #111;
+            border-radius: 28px;
+            padding: 18px;
+            background: linear-gradient(180deg, #1a1a1a, #080808);
+            min-height: 440px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.3);
+        }
+        .phone-top {
+            width: 120px;
+            height: 8px;
+            border-radius: 999px;
+            background: #222;
+            margin: 0 auto 18px;
+        }
+        .danger-text { color: #ff9f9f; }
+        .good-text { color: #8fffc0; }
+        .center { text-align: center; }
+    </style>
+</head>
+<body>
+    {% if show_nav %}
+    <div class="nav">
+        <div class="brand">{{ project_name }}</div>
+        <div class="nav-links">
+            {% if session.get("user_id") %}
+                <a href="{{ url_for('dashboard') }}">الرئيسية</a>
+                <a href="{{ url_for('cyber_info') }}">الأمن السيبراني</a>
+                <a href="{{ url_for('scenarios') }}">السيناريوهات</a>
+                <a href="{{ url_for('wifi_analysis') }}">تحليل Wi-Fi</a>
+                <a href="{{ url_for('hacker_lab') }}">مختبر التجارب</a>
+                <a href="{{ url_for('protection') }}">الحماية</a>
+                <a href="{{ url_for('quiz') }}">الاختبار</a>
+                <a href="{{ url_for('chatbot') }}">الشات بوت</a>
+                {% if session.get("is_admin") %}
+                    <a href="{{ url_for('admin_panel') }}">لوحة الأدمن</a>
+                {% endif %}
+                <a href="{{ url_for('logout') }}">تسجيل خروج</a>
+            {% else %}
+                <a href="{{ url_for('login') }}">تسجيل الدخول</a>
+                <a href="{{ url_for('register') }}">حساب جديد</a>
+            {% endif %}
         </div>
-    </body>
-    </html>
+    </div>
+    {% endif %}
+
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, msg in messages %}
+                    <div class="flash {{ category }}">{{ msg }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {{ content|safe }}
+    </div>
+
+    <div class="footer">
+        {{ project_name }} | مشروع توعوي بالأمن السيبراني - محاكاة تعليمية فقط
+    </div>
+</body>
+</html>
+"""
+
+
+def render_page(title, content, show_nav=True):
+    return render_template_string(
+        BASE_HTML,
+        title=title,
+        content=content,
+        show_nav=show_nav,
+        project_name=PROJECT_NAME,
+        session=session
+    )
+
+
+# =========================================================
+# المسارات الأساسية
+# =========================================================
+@app.route("/")
+def index():
+    if "user_id" in session:
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+
+        if len(username) < 3:
+            flash("اسم المستخدم قصير جدًا", "danger")
+            return redirect(url_for("register"))
+
+        if len(password) < 6:
+            flash("كلمة المرور يجب أن تكون 6 أحرف على الأقل", "danger")
+            return redirect(url_for("register"))
+
+        conn = db()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (username, password_hash, is_admin)
+                VALUES (?, ?, 0)
+            """, (username, generate_password_hash(password)))
+            conn.commit()
+            flash("تم إنشاء الحساب بنجاح، سجل الدخول الآن", "success")
+            return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            flash("اسم المستخدم موجود مسبقًا", "danger")
+        finally:
+            conn.close()
+
+    content = f"""
+    <div class="hero center">
+        <h1>إنشاء حساب جديد</h1>
+        <p>ابدأ رحلتك في التوعية بالأمن السيبراني داخل مشروع <b>{PROJECT_NAME}</b></p>
+    </div>
+
+    <div class="card" style="max-width:700px;margin:auto;">
+        <form method="post">
+            <label>اسم المستخدم</label>
+            <input type="text" name="username" placeholder="اكتب اسم المستخدم" required>
+
+            <label>كلمة المرور</label>
+            <input type="password" name="password" placeholder="اكتب كلمة المرور" required>
+
+            <button class="btn" type="submit">إنشاء الحساب</button>
+            <a class="btn btn-secondary" href="{url_for('login')}">عندي حساب</a>
+        </form>
+    </div>
     """
-    return html
+    return render_page("حساب جديد", content, show_nav=False)
 
 
-# =========================
-# الصفحات
-# =========================
-@app.route("/", methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    message = ""
-
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
 
         conn = db()
-        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user = cur.fetchone()
 
-        if user and check_password_hash(user["password_hash"], password):
-            session["user"] = username
-            session["is_admin"] = bool(user["is_admin"])
+        success = 0
 
-            conn.execute("""
-                UPDATE users
-                SET last_login_at = CURRENT_TIMESTAMP,
-                    login_count = COALESCE(login_count, 0) + 1
-                WHERE username = ?
-            """, (username,))
-            conn.commit()
-            conn.close()
+        if user:
+            if user["locked"] == 1:
+                conn.execute("""
+                    INSERT INTO login_logs (username, success, ip_address, user_agent)
+                    VALUES (?, ?, ?, ?)
+                """, (username, 0, get_ip(), request.headers.get("User-Agent", "Unknown")))
+                conn.commit()
+                conn.close()
+                flash("تم قفل الحساب بعد محاولات فاشلة متعددة، راجع الأدمن", "danger")
+                return redirect(url_for("login"))
 
-            log_login_attempt(username, "نجاح")
-            return redirect(url_for("dashboard"))
-        else:
-            conn.close()
-            log_login_attempt(username, "فشل")
-            message = '<div class="msg danger">بيانات الدخول غير صحيحة.</div>'
+            if check_password_hash(user["password_hash"], password):
+                session["user_id"] = user["id"]
+                session["username"] = user["username"]
+                session["is_admin"] = bool(user["is_admin"])
 
-    content = f"""
-    <section class="auth">
-        <div class="auth-card">
-            <div class="auth-title">🛡️ {PROJECT_NAME}</div>
-            <div class="auth-sub">تسجيل الدخول إلى منصة التوعية بالأمن السيبراني</div>
-            {message}
-            <form method="POST">
-                <div class="field"><input type="text" name="username" placeholder="اسم المستخدم" required></div>
-                <div class="field"><input type="password" name="password" placeholder="كلمة المرور" required></div>
-                <button class="btn btn-primary" type="submit">دخول</button>
-            </form>
-            <div style="margin-top:16px;">
-                <a class="muted" href="/register">إنشاء حساب جديد</a>
-            </div>
-        </div>
-    </section>
-    """
-    return render_template_string(base_page("تسجيل الدخول", content))
+                cur.execute("UPDATE users SET failed_attempts = 0 WHERE id = ?", (user["id"],))
+                success = 1
+                conn.execute("""
+                    INSERT INTO login_logs (username, success, ip_address, user_agent)
+                    VALUES (?, ?, ?, ?)
+                """, (username, success, get_ip(), request.headers.get("User-Agent", "Unknown")))
+                conn.commit()
+                conn.close()
 
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    message = ""
-
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-        confirm = request.form.get("confirm_password", "").strip()
-
-        if not username or not password or not confirm:
-            message = '<div class="msg danger">جميع الحقول مطلوبة.</div>'
-        elif len(username) < 3:
-            message = '<div class="msg danger">اسم المستخدم يجب أن يكون 3 أحرف على الأقل.</div>'
-        elif password != confirm:
-            message = '<div class="msg danger">كلمتا المرور غير متطابقتين.</div>'
-        else:
-            evaluation = evaluate_password(password)
-            if evaluation["level"] == "ضعيفة":
-                message = '<div class="msg danger">كلمة المرور ضعيفة. اختر كلمة أقوى.</div>'
+                flash("تم تسجيل الدخول بنجاح", "success")
+                return redirect(url_for("dashboard"))
             else:
-                conn = db()
-                try:
-                    conn.execute(
-                        "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)",
-                        (username, generate_password_hash(password), 0)
-                    )
-                    conn.commit()
-                    conn.close()
-                    return redirect(url_for("login"))
-                except sqlite3.IntegrityError:
-                    conn.close()
-                    message = '<div class="msg danger">اسم المستخدم مستخدم بالفعل.</div>'
+                new_attempts = user["failed_attempts"] + 1
+                locked = 1 if new_attempts >= 3 else 0
+                cur.execute("""
+                    UPDATE users
+                    SET failed_attempts = ?, locked = ?
+                    WHERE id = ?
+                """, (new_attempts, locked, user["id"]))
+        else:
+            # لو المستخدم غير موجود، نسجل المحاولة فقط
+            pass
 
-    content = f"""
-    <section class="auth">
-        <div class="auth-card">
-            <div class="auth-title">إنشاء حساب جديد</div>
-            <div class="auth-sub">أنشئ حسابًا للوصول إلى المنصة</div>
-            {message}
-            <form method="POST">
-                <div class="field"><input type="text" name="username" placeholder="اسم المستخدم" required></div>
-                <div class="field"><input type="password" name="password" placeholder="كلمة المرور" required></div>
-                <div class="field"><input type="password" name="confirm_password" placeholder="تأكيد كلمة المرور" required></div>
-                <button class="btn btn-primary" type="submit">إنشاء الحساب</button>
-            </form>
-            <div style="margin-top:16px;">
-                <a class="muted" href="/">العودة لتسجيل الدخول</a>
-            </div>
+        conn.execute("""
+            INSERT INTO login_logs (username, success, ip_address, user_agent)
+            VALUES (?, ?, ?, ?)
+        """, (username, success, get_ip(), request.headers.get("User-Agent", "Unknown")))
+        conn.commit()
+        conn.close()
+
+        flash("بيانات الدخول غير صحيحة", "danger")
+        return redirect(url_for("login"))
+
+    content = """
+    <div class="hero center">
+        <h1>تسجيل دخول إلى محاكي الأمن السيبراني</h1>
+        <p>واجهة تعليمية عربية احترافية لمحاكاة المخاطر الرقمية وطرق الحماية</p>
+    </div>
+
+    <div class="card" style="max-width:760px;margin:auto;">
+        <form method="post">
+            <label>اسم المستخدم</label>
+            <input type="text" name="username" placeholder="اكتب اسم المستخدم" required>
+
+            <label>كلمة المرور</label>
+            <input type="password" name="password" id="passwordField" placeholder="اكتب كلمة المرور" required>
+
+            <button type="button" class="btn btn-secondary" onclick="togglePassword()">إظهار / إخفاء كلمة المرور</button>
+            <br><br>
+            <button class="btn" type="submit">دخول</button>
+            <a class="btn btn-secondary" href="/register">إنشاء حساب</a>
+        </form>
+
+        <div class="card" style="margin-top:18px;">
+            <h3>نصيحة سيبرانية</h3>
+            <p>{{ tip }}</p>
+            <p class="muted">معلومة مهمة: هذا المشروع للتوعية والمحاكاة التعليمية فقط.</p>
         </div>
-    </section>
+    </div>
+
+    <script>
+    function togglePassword() {
+        const field = document.getElementById("passwordField");
+        field.type = field.type === "password" ? "text" : "password";
+    }
+    </script>
     """
-    return render_template_string(base_page("إنشاء حساب", content))
+    return render_template_string(
+        BASE_HTML,
+        title="تسجيل الدخول",
+        content=render_template_string(content, tip=cyber_tip()),
+        show_nav=False,
+        project_name=PROJECT_NAME,
+        session=session
+    )
 
 
 @app.route("/logout")
 def logout():
     session.clear()
+    flash("تم تسجيل الخروج", "info")
     return redirect(url_for("login"))
 
 
+# =========================================================
+# لوحة المستخدم
+# =========================================================
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    username = session["user"]
-    level = get_user_level(username)
-
-    conn = db()
-    latest_quiz = conn.execute(
-        "SELECT * FROM quiz_results WHERE username = ? ORDER BY id DESC LIMIT 1",
-        (username,)
-    ).fetchone()
-    phish_count = conn.execute(
-        "SELECT COUNT(*) AS total FROM phishing_logs WHERE username = ?",
-        (username,)
-    ).fetchone()["total"]
-    user_row = conn.execute(
-        "SELECT created_at, last_login_at, login_count FROM users WHERE username = ?",
-        (username,)
-    ).fetchone()
-    conn.close()
-
-    latest_result_html = ""
-    if latest_quiz:
-        latest_result_html = f"""
-        <div class="panel">
-            <h3>آخر نتيجة لك في الاختبار</h3>
-            <p>الدرجة: <strong>{latest_quiz["score"]}/{latest_quiz["total"]}</strong></p>
-        </div>
-        """
-
-    hero_img = svg_data_uri("🛡️", "منصة التدريب السيبراني", "#00e0ff", "#00ff9c")
+    user = get_user()
+    level = get_user_level(user["id"])
 
     content = f"""
-    <section class="panel hero">
-        <div>
-            <div class="title">مرحبًا {username} في {PROJECT_NAME}</div>
-            <div class="sub">
-                منصة عربية تجمع بين التوعية والتجارب التفاعلية والتحليل العملي،
-                لتعليم المستخدم كيف يحمي نفسه من التصيد الاحتيالي والشبكات غير الآمنة
-                وكلمات المرور الضعيفة.
-            </div>
-            <div class="btns">
-                <a class="btn btn-primary" href="/hacker">ابدأ مختبر التجارب</a>
-                <a class="btn btn-secondary" href="/quiz">ابدأ الاختبار</a>
-            </div>
-        </div>
-        <div>
-            <img class="image-card" src="{hero_img}" alt="Cyber Hero">
-        </div>
-    </section>
+    <div class="hero">
+        <h1>مرحبًا {user["username"]} 👋</h1>
+        <p>مستواك الحالي: <span class="badge safe">{level}</span></p>
+        <p>نصيحة اليوم: {cyber_tip()}</p>
+        <p>هذا النظام صُمم لتوعية المستخدمين بالمخاطر الرقمية بأسلوب تفاعلي واقعي واحترافي.</p>
+    </div>
 
-    <section class="grid">
+    <div class="grid">
         <div class="card">
-            <h3>مستوى المستخدم</h3>
-            <p>{level}</p>
+            <h3>🛡️ الأمن السيبراني</h3>
+            <p>تعرف على المفاهيم الأساسية وأهمية حماية الأجهزة والحسابات والبيانات.</p>
+            <a class="btn" href="{url_for('cyber_info')}">فتح القسم</a>
         </div>
-        <div class="card">
-            <h3>تجارب التصيد المكتملة</h3>
-            <p>{phish_count}</p>
-        </div>
-        <div class="card">
-            <h3>عدد مرات الدخول</h3>
-            <p>{user_row["login_count"] or 0}</p>
-        </div>
-        <div class="card">
-            <h3>آخر دخول</h3>
-            <p>{user_row["last_login_at"] or "أول دخول"}</p>
-        </div>
-    </section>
 
-    <section class="grid">
-        <a class="card" href="/cyber-info"><h3>💻 الأمن السيبراني</h3><p>تعريفات ومفاهيم أساسية وأمثلة واقعية.</p></a>
-        <a class="card" href="/scenarios"><h3>🎭 السيناريوهات</h3><p>حالات تصيد واحتيال شائعة مع صفحات تفصيلية وروابط داخلية.</p></a>
-        <a class="card" href="/wifi"><h3>📶 تحليل Wi-Fi</h3><p>اختر شبكة واكتب كلمة المرور لتحصل على تحليل أشمل.</p></a>
-        <a class="card" href="/protection"><h3>🛡️ الحماية</h3><p>نصائح أمنية وفاحص لقوة كلمة المرور.</p></a>
-        <a class="card" href="/chatbot"><h3>🤖 الشات بوت</h3><p>مساعد توعوي يجيب عن الأسئلة الشائعة.</p></a>
-        <a class="card" href="/quiz"><h3>📝 الاختبار</h3><p>اختبار من 10 أسئلة مع نتيجة نهائية.</p></a>
-    </section>
+        <div class="card">
+            <h3>🎭 السيناريوهات</h3>
+            <p>أمثلة عملية لرسائل وروابط احتيالية وكيفية اكتشافها قبل الوقوع فيها.</p>
+            <a class="btn" href="{url_for('scenarios')}">عرض السيناريوهات</a>
+        </div>
 
-    {latest_result_html}
+        <div class="card">
+            <h3>📡 تحليل Wi-Fi</h3>
+            <p>تعلم الفرق بين الشبكات الآمنة والخطرة ولماذا تعد الشبكات المفتوحة مخاطرة.</p>
+            <a class="btn" href="{url_for('wifi_analysis')}">تحليل الشبكات</a>
+        </div>
+
+        <div class="card">
+            <h3>💀 مختبر التجارب</h3>
+            <p>محاكاة تعليمية لواجهة تصيد مزيفة مع شاشة هكر توضح خطورة تسريب البيانات.</p>
+            <a class="btn" href="{url_for('hacker_lab')}">دخول المختبر</a>
+        </div>
+
+        <div class="card">
+            <h3>🔐 الحماية</h3>
+            <p>اختبر قوة كلمة المرور وخذ نصائح عملية لتأمين حساباتك وأجهزتك.</p>
+            <a class="btn" href="{url_for('protection')}">افتح الحماية</a>
+        </div>
+
+        <div class="card">
+            <h3>📝 الاختبار</h3>
+            <p>اختبر معلوماتك واطلع على نتيجتك وتقييمك في الأمن السيبراني.</p>
+            <a class="btn" href="{url_for('quiz')}">ابدأ الاختبار</a>
+        </div>
+
+        <div class="card">
+            <h3>🤖 الشات بوت</h3>
+            <p>اسأل المستشار الذكي عن مفاهيم الأمن السيبراني والروابط المشبوهة والحماية.</p>
+            <a class="btn" href="{url_for('chatbot')}">افتح الشات بوت</a>
+        </div>
+    </div>
     """
-    return render_template_string(base_page("الرئيسية", content, username))
+    return render_page("الرئيسية", content)
 
 
-@app.route("/admin")
-@admin_required
-def admin_panel():
-    conn = db()
-
-    users_count = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
-    quiz_count = conn.execute("SELECT COUNT(*) AS total FROM quiz_results").fetchone()["total"]
-    phishing_count = conn.execute("SELECT COUNT(*) AS total FROM phishing_logs").fetchone()["total"]
-    login_logs_count = conn.execute("SELECT COUNT(*) AS total FROM login_logs").fetchone()["total"]
-
-    latest_users = conn.execute("""
-        SELECT id, username, is_admin, created_at, last_login_at, login_count
-        FROM users
-        ORDER BY id DESC
-        LIMIT 20
-    """).fetchall()
-
-    quiz_results = conn.execute("""
-        SELECT id, username, score, total, created_at
-        FROM quiz_results
-        ORDER BY id DESC
-        LIMIT 20
-    """).fetchall()
-
-    phishing_rows = conn.execute("""
-        SELECT id, username, fake_username, password_strength, risk_level, created_at
-        FROM phishing_logs
-        ORDER BY id DESC
-        LIMIT 20
-    """).fetchall()
-
-    login_rows = conn.execute("""
-        SELECT id, username, status, user_agent, created_at
-        FROM login_logs
-        ORDER BY id DESC
-        LIMIT 30
-    """).fetchall()
-
-    admin_rows = conn.execute("""
-        SELECT id, admin_username, action, created_at
-        FROM admin_logs
-        ORDER BY id DESC
-        LIMIT 30
-    """).fetchall()
-
-    conn.close()
-
-    users_rows = ""
-    for row in latest_users:
-        role = "أدمن" if row["is_admin"] else "مستخدم"
-        users_rows += f"""
-        <tr>
-            <td>{row["id"]}</td>
-            <td>{row["username"]}</td>
-            <td>{role}</td>
-            <td>{row["created_at"] or "-"}</td>
-            <td>{row["last_login_at"] or "-"}</td>
-            <td>{row["login_count"] or 0}</td>
-        </tr>
-        """
-
-    quiz_rows = ""
-    for row in quiz_results:
-        quiz_rows += f"""
-        <tr>
-            <td>{row["id"]}</td>
-            <td>{row["username"]}</td>
-            <td>{row["score"]}</td>
-            <td>{row["total"]}</td>
-            <td>{row["created_at"]}</td>
-        </tr>
-        """
-
-    phish_table = ""
-    for row in phishing_rows:
-        phish_table += f"""
-        <tr>
-            <td>{row["id"]}</td>
-            <td>{row["username"]}</td>
-            <td>{row["fake_username"] or "-"}</td>
-            <td>{row["password_strength"]}</td>
-            <td>{row["risk_level"]}</td>
-            <td>{row["created_at"]}</td>
-        </tr>
-        """
-
-    login_table = ""
-    for row in login_rows:
-        login_table += f"""
-        <tr>
-            <td>{row["id"]}</td>
-            <td>{row["username"]}</td>
-            <td>{row["status"]}</td>
-            <td>{row["user_agent"] or "-"}</td>
-            <td>{row["created_at"]}</td>
-        </tr>
-        """
-
-    admin_table = ""
-    for row in admin_rows:
-        admin_table += f"""
-        <tr>
-            <td>{row["id"]}</td>
-            <td>{row["admin_username"]}</td>
-            <td>{row["action"]}</td>
-            <td>{row["created_at"]}</td>
-        </tr>
-        """
-
-    content = f"""
-    <section class="panel">
-        <h2>👑 لوحة الأدمن</h2>
-        <p class="sub">هذه الصفحة مخصصة للإدارة فقط وتعرض نظرة شاملة على المستخدمين والسجلات والنتائج.</p>
-    </section>
-
-    <section class="grid">
-        <div class="card"><h3>عدد المستخدمين</h3><p>{users_count}</p></div>
-        <div class="card"><h3>عدد نتائج الاختبار</h3><p>{quiz_count}</p></div>
-        <div class="card"><h3>عدد تجارب التصيد</h3><p>{phishing_count}</p></div>
-        <div class="card"><h3>سجل محاولات الدخول</h3><p>{login_logs_count}</p></div>
-    </section>
-
-    <section class="panel">
-        <h3>آخر المستخدمين</h3>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>اسم المستخدم</th>
-                        <th>النوع</th>
-                        <th>تاريخ الإنشاء</th>
-                        <th>آخر دخول</th>
-                        <th>عدد مرات الدخول</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {users_rows if users_rows else '<tr><td colspan="6">لا يوجد مستخدمون</td></tr>'}
-                </tbody>
-            </table>
-        </div>
-    </section>
-
-    <section class="panel">
-        <h3>سجل الدخول</h3>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr><th>#</th><th>اسم المستخدم</th><th>الحالة</th><th>الجهاز</th><th>التاريخ</th></tr>
-                </thead>
-                <tbody>
-                    {login_table if login_table else '<tr><td colspan="5">لا توجد سجلات دخول</td></tr>'}
-                </tbody>
-            </table>
-        </div>
-    </section>
-
-    <section class="panel">
-        <h3>سجل عمليات الأدمن</h3>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr><th>#</th><th>الأدمن</th><th>العملية</th><th>التاريخ</th></tr>
-                </thead>
-                <tbody>
-                    {admin_table if admin_table else '<tr><td colspan="4">لا توجد عمليات</td></tr>'}
-                </tbody>
-            </table>
-        </div>
-    </section>
-
-    <section class="panel">
-        <h3>آخر نتائج الاختبارات</h3>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr><th>#</th><th>اسم المستخدم</th><th>الدرجة</th><th>من</th><th>التاريخ</th></tr>
-                </thead>
-                <tbody>
-                    {quiz_rows if quiz_rows else '<tr><td colspan="5">لا توجد نتائج</td></tr>'}
-                </tbody>
-            </table>
-        </div>
-    </section>
-
-    <section class="panel">
-        <h3>آخر تجارب التصيد</h3>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr><th>#</th><th>المستخدم</th><th>الاسم المدخل</th><th>قوة الكلمة</th><th>مستوى الخطر</th><th>التاريخ</th></tr>
-                </thead>
-                <tbody>
-                    {phish_table if phish_table else '<tr><td colspan="6">لا توجد سجلات</td></tr>'}
-                </tbody>
-            </table>
-        </div>
-    </section>
-    """
-    return render_template_string(base_page("لوحة الأدمن", content, session["user"]))
-
-
-@app.route("/cyber-info")
+@app.route("/cyber_info")
 @login_required
 def cyber_info():
-    img1 = svg_data_uri("💻", "الأمن السيبراني", "#00e0ff", "#00a3ff")
-    img2 = svg_data_uri("🔐", "السرية والنزاهة", "#00ff9c", "#00d4aa")
+    content = """
+    <div class="hero">
+        <h1>ما هو الأمن السيبراني؟</h1>
+        <p>الأمن السيبراني هو عملية حماية الأنظمة والشبكات والبرامج والبيانات من الهجمات الرقمية.</p>
+        <p>الهدف منه هو منع الوصول غير المصرح به والتخريب وسرقة المعلومات.</p>
+    </div>
 
-    content = f"""
-    <section class="panel">
-        <h2>💻 ما هو الأمن السيبراني؟</h2>
-        <p class="sub">
-            الأمن السيبراني هو مجال حماية الأنظمة والشبكات والبرامج والبيانات من
-            الهجمات الإلكترونية أو الوصول غير المصرح به أو العبث بالمعلومات.
-        </p>
-    </section>
-
-    <section class="grid">
+    <div class="grid">
         <div class="card">
-            <img class="image-card" src="{img1}" alt="Cybersecurity">
-            <h3>الأساسيات</h3>
-            <p>يشمل الأمن السيبراني حماية الأجهزة والهواتف والشبكات والخوادم والبيانات من المخاطر الرقمية.</p>
+            <h3>🔐 لماذا هو مهم؟</h3>
+            <p>لأنه يحمي حساباتك وصورك وبياناتك البنكية وخصوصيتك من الاحتيال والاختراق.</p>
         </div>
-
         <div class="card">
-            <img class="image-card" src="{img2}" alt="CIA">
-            <h3>الأهداف الرئيسية</h3>
-            <p>السرية، النزاهة، والتوافر هي الركائز الأساسية لأي نظام آمن.</p>
+            <h3>🎣 ما هو التصيد؟</h3>
+            <p>رسائل أو مواقع مزيفة هدفها خداعك لكتابة بياناتك أو كلمة المرور أو رمز التحقق.</p>
         </div>
-    </section>
-
-    <section class="grid">
-        <div class="card"><h3>السرية</h3><p>منع غير المصرح لهم من الوصول إلى المعلومات الحساسة.</p></div>
-        <div class="card"><h3>النزاهة</h3><p>ضمان عدم تعديل البيانات أو العبث بها دون إذن.</p></div>
-        <div class="card"><h3>التوافر</h3><p>استمرار عمل الأنظمة والخدمات للمستخدمين المصرح لهم.</p></div>
-    </section>
-
-    <section class="panel">
-        <h3>💡 ما هو Kali Linux؟</h3>
-        <p class="sub">
-            كالي لينكس نظام مبني على لينكس ومخصص لتعلم الأمن السيبراني واختبار
-            الاختراق الأخلاقي، ويحتوي على أدوات تحليل وفحص متقدمة.
-        </p>
-    </section>
+        <div class="card">
+            <h3>🧠 ما هي الهندسة الاجتماعية؟</h3>
+            <p>هي خداع نفسي يعتمد على الخوف أو الاستعجال أو الثقة بدل الاعتماد فقط على التقنية.</p>
+        </div>
+        <div class="card">
+            <h3>🐧 ما علاقة Linux و Kali؟</h3>
+            <p>أنظمة Linux تُستخدم في إدارة الأنظمة والأمن السيبراني، وKali Linux مشهور في بيئات الاختبار والتعلم الأمني.</p>
+        </div>
+    </div>
     """
-    return render_template_string(base_page("الأمن السيبراني", content, session["user"]))
+    return render_page("الأمن السيبراني", content)
 
 
 @app.route("/scenarios")
 @login_required
 def scenarios():
     cards = ""
-    colors = [
-        ("#00e0ff", "#00ff9c"),
-        ("#4cc9f0", "#4895ef"),
-        ("#ff6b6b", "#f06595"),
-        ("#ffd43b", "#fab005"),
-    ]
-
-    for i, item in enumerate(SCENARIOS):
-        c1, c2 = colors[i % len(colors)]
-        image = svg_data_uri(item["icon"], item["title"], c1, c2)
+    for s in SCENARIOS:
+        risk_class = "danger-badge" if s["risk"] in ["غالبًا تصيد", "خطر مرتفع", "احتيال", "رابط مزيف"] else "medium"
         cards += f"""
         <div class="card">
-            <img class="image-card" src="{image}" alt="{item["title"]}">
-            <h3>{item["icon"]} {item["title"]}</h3>
-            <p>{item["desc"]}</p>
-            <div class="tip">{item["tip"]}</div>
-            <div class="btns" style="margin-top:14px;">
-                <a class="btn btn-primary" href="/scenario/{item["slug"]}">عرض الصفحة</a>
-                <a class="btn btn-secondary" href="/protection">الحماية</a>
-            </div>
+            <h3>{s["title"]}</h3>
+            <p>{s["desc"]}</p>
+            <p><span class="badge {risk_class}">{s["risk"]}</span></p>
+            <p><b>النصيحة:</b> {s["tip"]}</p>
         </div>
         """
 
     content = f"""
-    <section class="panel">
-        <h2>🎭 سيناريوهات احتيال شائعة</h2>
-        <p class="sub">هذه الحالات تحاكي أكثر أنواع الخداع انتشارًا في الحياة الرقمية، وكل سيناريو له صفحة تفصيلية وروابط داخلية.</p>
-        <div class="grid">{cards}</div>
-    </section>
+    <div class="hero">
+        <h1>سيناريوهات توعوية واقعية</h1>
+        <p>هذه أمثلة شائعة لأساليب الاحتيال الرقمي التي تستغل استعجال المستخدم أو ثقته.</p>
+    </div>
+    <div class="grid">
+        {cards}
+    </div>
     """
-    return render_template_string(base_page("السيناريوهات", content, session["user"]))
-
-
-@app.route("/scenario/<slug>")
-@login_required
-def scenario_page(slug):
-    item = find_scenario(slug)
-    if not item:
-        return redirect(url_for("scenarios"))
-
-    image = svg_data_uri(item["icon"], item["title"], "#00e0ff", "#00ff9c")
-
-    signals_html = "".join([f"<li>{s}</li>" for s in item["signals"]])
-
-    links_html = ""
-    for text, href in item["safe_links"]:
-        links_html += f'<a class="btn btn-primary" href="{href}">{text}</a>'
-
-    content = f"""
-    <section class="panel hero">
-        <div>
-            <div class="title">{item["icon"]} {item["title"]}</div>
-            <div class="sub">{item["details"]}</div>
-            <div class="tip">{item["tip"]}</div>
-            <div class="btns" style="margin-top:14px;">
-                {links_html}
-            </div>
-        </div>
-        <div>
-            <img class="image-card" src="{image}" alt="{item["title"]}">
-        </div>
-    </section>
-
-    <section class="panel">
-        <h3>علامات الخطر</h3>
-        <ul class="list">{signals_html}</ul>
-    </section>
-
-    <section class="panel">
-        <h3>التصرف الصحيح</h3>
-        <div class="msg success">
-            التصرف الصحيح هو عدم الاستعجال، وعدم إدخال أي بيانات حساسة، وفتح الجهة الرسمية بنفسك بدل الضغط على أي رابط مشبوه.
-        </div>
-    </section>
-    """
-    return render_template_string(base_page(item["title"], content, session["user"]))
+    return render_page("السيناريوهات", content)
 
 
 @app.route("/wifi", methods=["GET", "POST"])
 @login_required
-def wifi():
-    selected_name = request.values.get("name", "")
-    selected = None
-    for item in WIFI_NETWORKS:
-        if item["name"] == selected_name:
-            selected = item
-            break
-
-    cards = ""
-    for net in WIFI_NETWORKS:
-        image = svg_data_uri("📶", net["name"], "#00e0ff", "#00ff9c")
-        bclass = badge_class_from_risk(net["risk"])
-        cards += f"""
-        <a class="card" href="/wifi?name={net["name"]}">
-            <img class="image-card" src="{image}" alt="{net["name"]}">
-            <h3>{net["name"]}</h3>
-            <p>التشفير: {net["enc"]}</p>
-            <p>قوة الإشارة: {net["signal"]}%</p>
-            <span class="badge {bclass}">{net["risk"]}</span>
-        </a>
-        """
-
-    analysis = ""
-    password_section = ""
-
-    if selected:
-        bclass = badge_class_from_risk(selected["risk"])
-        note = (
-            "هذه الشبكة أفضل من غيرها، ومع ذلك حافظ على الحذر."
-            if selected["risk"] == "آمنة"
-            else "يمكن استخدامها بحذر مع تجنب إدخال بيانات حساسة."
-            if selected["risk"] == "متوسطة"
-            else "هذه الشبكة غير مناسبة لإدخال كلمات المرور أو البيانات البنكية."
-        )
-
-        entered_password = request.form.get("wifi_password", "") if request.method == "POST" else ""
-        password_result_html = ""
-        if entered_password:
-            result = evaluate_wifi_password(entered_password, selected["risk"])
-            notes_html = "".join([f"<li>{n}</li>" for n in result["notes"]])
-            password_result_html = f"""
-            <section class="panel">
-                <h3>تحليل كلمة مرور الشبكة</h3>
-                <p class="sub"><strong>التقييم:</strong> <span class="badge {result["color"]}">{result["level"]}</span></p>
-                <p class="sub"><strong>الدرجة:</strong> {result["score"]}</p>
-                <ul class="list">{notes_html}</ul>
-            </section>
-            """
-
-        password_section = f"""
-        <section class="panel">
-            <h3>فحص كلمة مرور الشبكة</h3>
-            <p class="sub">{wifi_password_hint(selected["risk"])}</p>
-            <form method="POST">
-                <input type="hidden" name="name" value="{selected["name"]}">
-                <div class="field">
-                    <input type="text" name="wifi_password" placeholder="اكتب كلمة مرور الشبكة لتحليلها" value="{entered_password}">
-                </div>
-                <button class="btn btn-primary" type="submit">تحليل كلمة المرور</button>
-            </form>
-        </section>
-        {password_result_html}
-        """
-
-        analysis = f"""
-        <section class="panel">
-            <h3>نتيجة التحليل: {selected["name"]}</h3>
-            <p class="sub"><strong>مستوى الأمان:</strong> {selected["risk"]}</p>
-            <p class="sub"><strong>نوع التشفير:</strong> {selected["enc"]}</p>
-            <p class="sub"><strong>قوة الإشارة:</strong> {selected["signal"]}%</p>
-            <p class="sub"><strong>السبب:</strong> {selected["reason"]}</p>
-            <div class="msg {bclass}">{note}</div>
-        </section>
-        """
-
-    content = f"""
-    <section class="panel">
-        <h2>📶 تحليل الشبكات اللاسلكية</h2>
-        <p class="sub">اختر أي شبكة لعرض حالة الأمان، ثم اكتب كلمة المرور لتحصل على تحليل إضافي لقوتها.</p>
-        <div class="grid">{cards}</div>
-    </section>
-    {analysis}
-    {password_section}
-    """
-    return render_template_string(base_page("تحليل Wi-Fi", content, session["user"]))
-
-
-@app.route("/hacker", methods=["GET", "POST"])
-@login_required
-def hacker():
-    simulation = """
-[+] CYBER AWARENESS LAB READY...
-[+] WAITING FOR USER INPUT...
-[+] أدخل بيانات المحاكاة لرؤية النتيجة التوعوية
-    """.strip()
-
-    details = ""
+def wifi_analysis():
+    result_html = ""
 
     if request.method == "POST":
-        fake_username = request.form.get("fake_username", "").strip()
-        fake_password = request.form.get("fake_password", "").strip()
+        selected = request.form.get("network")
+        network = next((n for n in WIFI_NETWORKS if n["name"] == selected), None)
 
-        if fake_username and fake_password:
-            strength = evaluate_password(fake_password)
-
-            simulation = f"""
-[+] STARTING EDUCATIONAL EXPERIENCE...
-[+] TRAINING FORM DETECTED
-[+] ENTERED USERNAME: {fake_username}
-[+] PASSWORD ENTERED: [HIDDEN FOR SAFETY]
-[+] PASSWORD STRENGTH: {strength["level"]}
-[!] WARNING: إدخال البيانات في صفحة مزيفة قد يعرّض الحساب للسرقة
-[✔] EXPERIENCE FINISHED
-            """.strip()
-
-            notes = "".join([f"<li>{n}</li>" for n in strength["notes"]])
-            details = f"""
-            <section class="panel">
-                <h3>نتيجة التجربة</h3>
-                <p class="sub"><strong>اسم المستخدم المدخل:</strong> {fake_username}</p>
-                <p class="sub"><strong>قوة كلمة المرور:</strong> {strength["level"]}</p>
-                <ul class="list">{notes}</ul>
-                <div class="msg danger">هذه تجربة تعليمية فقط، لكنها توضح كيف يمكن لصفحات التصيد أن تجمع بياناتك إذا أدخلتها في موقع غير موثوق.</div>
-            </section>
-            """
-
-    image = svg_data_uri("🧠", "مختبر التجارب السيبرانية", "#00ff9c", "#00e0ff")
-
-    content = f"""
-    <section class="panel">
-        <h2>🧠 مختبر التجارب السيبرانية</h2>
-        <p class="sub">قسم تفاعلي يعرّض المستخدم لتجارب واقعية آمنة تساعده على اكتشاف الخطر قبل الوقوع فيه.</p>
-    </section>
-
-    <section class="hero">
-        <div class="panel" style="margin-bottom:0;">
-            <h3>🎣 نموذج توعوي مشابه للتصيد</h3>
-            <form method="POST" style="margin-top:16px;">
-                <div class="field"><input type="text" name="fake_username" placeholder="اسم المستخدم" required></div>
-                <div class="field"><input type="password" name="fake_password" placeholder="كلمة المرور" required></div>
-                <button class="btn btn-danger" type="submit">تشغيل التجربة</button>
-            </form>
-        </div>
-
-        <div class="card">
-            <img class="image-card" src="{image}" alt="مختبر التجارب">
-            <div class="terminal">
-                <div class="terminal-head"><span></span><span></span><span></span></div>
-                <div class="terminal-body">{simulation}</div>
+        if network:
+            badge_class = "safe" if network["risk"] == "آمنة" else "medium" if network["risk"] == "متوسطة" else "danger-badge"
+            result_html = f"""
+            <div class="card">
+                <h3>نتيجة التحليل</h3>
+                <p><b>اسم الشبكة:</b> {network["name"]}</p>
+                <p><b>نوع الحماية:</b> {network["security"]}</p>
+                <p><b>قوة الإشارة:</b> {network["signal"]}</p>
+                <p><b>التقييم:</b> <span class="badge {badge_class}">{network["risk"]}</span></p>
+                <p><b>السبب:</b> {network["reason"]}</p>
             </div>
+            """
+
+    options = "".join([f'<option value="{n["name"]}">{n["name"]}</option>' for n in WIFI_NETWORKS])
+
+    content = f"""
+    <div class="hero">
+        <h1>تحليل شبكات Wi-Fi</h1>
+        <p>اختر شبكة لمعرفة مستوى الأمان والمخاطر المرتبطة بها.</p>
+    </div>
+
+    <div class="card">
+        <form method="post">
+            <label>اختر شبكة</label>
+            <select name="network" required>
+                <option value="">-- اختر --</option>
+                {options}
+            </select>
+            <button class="btn" type="submit">تحليل</button>
+        </form>
+    </div>
+
+    {result_html}
+
+    <div class="grid">
+        <div class="card">
+            <h3>نصيحة مهمة</h3>
+            <p>الشبكات المفتوحة ليست مناسبة لتسجيل الدخول إلى الحسابات أو تنفيذ عمليات مالية.</p>
         </div>
-    </section>
-
-    {details}
+        <div class="card">
+            <h3>ماذا أفعل عند الاضطرار؟</h3>
+            <p>استخدم VPN وتجنب إدخال كلمات المرور والمعلومات الحساسة.</p>
+        </div>
+    </div>
     """
-    return render_template_string(base_page("مختبر التجارب", content, session["user"]))
+    return render_page("تحليل Wi-Fi", content)
 
 
-@app.route("/fake-bank", methods=["GET", "POST"])
+@app.route("/hacker-lab", methods=["GET", "POST"])
 @login_required
-def fake_bank():
+def hacker_lab():
+    output = ""
+    fake_user = ""
+    fake_pass = ""
+
     if request.method == "POST":
-        fake_user = request.form.get("username", "").strip()
-        fake_pass = request.form.get("password", "").strip()
+        fake_user = request.form.get("fake_username", "").strip()
+        fake_pass = request.form.get("fake_password", "").strip()
+        strength = analyze_password_strength(fake_pass)
 
-        session["last_fake_user"] = fake_user
-        session["last_password_strength"] = evaluate_password(fake_pass)["level"]
+        risk_level = "منخفض"
+        if strength["level"] == "ضعيفة":
+            risk_level = "مرتفع"
+        elif strength["level"] == "متوسطة":
+            risk_level = "متوسط"
 
-        strength = evaluate_password(fake_pass)
         conn = db()
-        conn.execute(
-            "INSERT INTO phishing_logs (username, fake_username, password_strength, risk_level) VALUES (?, ?, ?, ?)",
-            (session["user"], fake_user, strength["level"], "مرتفع")
-        )
+        conn.execute("""
+            INSERT INTO phishing_logs (user_id, fake_username, password_strength, risk_level)
+            VALUES (?, ?, ?, ?)
+        """, (session["user_id"], fake_user, strength["level"], risk_level))
         conn.commit()
         conn.close()
 
-        return redirect(url_for("phishing_result"))
-
-    image = svg_data_uri("🏦", "بوابة التحقق البنكي", "#00e0ff", "#ff4d6d")
+        output = f"""
+        <div class="card">
+            <h3>نتيجة المحاكاة التعليمية</h3>
+            <p class="danger-text"><b>تنبيه:</b> لو كانت هذه صفحة مزيفة حقيقية فإدخال البيانات هنا قد يعرّضك للاختراق.</p>
+            <p><b>اسم المستخدم الذي تم إدخاله:</b> {fake_user}</p>
+            <p><b>قوة كلمة المرور:</b> <span style="color:{strength["color"]};font-weight:bold;">{strength["level"]}</span></p>
+            <p><b>مستوى الخطورة:</b> {risk_level}</p>
+            <p><b>الهدف من المحاكاة:</b> توضيح كيف تقع البيانات في صفحات مزيفة ظاهرها طبيعي.</p>
+        </div>
+        """
 
     content = f"""
-    <section class="panel">
-        <h2>🏦 بوابة التحقق البنكي</h2>
-        <p class="sub">هذه صفحة تدريبية داخل المشروع تحاكي شكل صفحة تصيد تقلد جهة رسمية.</p>
-    </section>
+    <div class="hero">
+        <h1>مختبر التجارب التعليمية</h1>
+        <p>هذه الصفحة محاكاة توعوية فقط ولا يوجد فيها أي اختراق حقيقي.</p>
+    </div>
 
-    <section class="hero">
-        <div class="auth-card" style="margin:0 auto;">
-            <div class="auth-title">التحقق من الحساب البنكي</div>
-            <div class="auth-sub">يرجى تسجيل الدخول لتأكيد هوية الحساب</div>
+    <div class="split">
+        <div class="phone-frame">
+            <div class="phone-top"></div>
+            <div class="card" style="background:rgba(255,255,255,0.02);">
+                <h3 class="center">Instagram Login</h3>
+                <p class="muted center">مثال تعليمي لواجهة مزيفة قد تشبه صفحات معروفة</p>
+                <form method="post">
+                    <label>اسم المستخدم</label>
+                    <input type="text" name="fake_username" placeholder="Phone, username, email" required>
 
-            <form method="POST">
-                <div class="field"><input type="text" name="username" placeholder="اسم المستخدم أو رقم الهوية" required></div>
-                <div class="field"><input type="password" name="password" placeholder="كلمة المرور" required></div>
-                <button class="btn btn-danger" type="submit">تسجيل الدخول</button>
-            </form>
+                    <label>كلمة المرور</label>
+                    <input type="password" name="fake_password" placeholder="Password" required>
 
-            <div class="tip">
-                كثير من صفحات التصيد تستخدم عبارات مثل: "تحقق الآن فورًا" أو "حسابك موقوف".
+                    <button class="btn" type="submit">Log in</button>
+                </form>
             </div>
         </div>
 
         <div class="card">
-            <img class="image-card" src="{image}" alt="بوابة مزيفة">
-            <p class="sub">هذه التجربة توضح كيف تبدو بعض الصفحات المزيفة بشكل مقنع للمستخدم.</p>
-        </div>
-    </section>
-    """
-    return render_template_string(base_page("صفحة تصيد مزيفة", content, session["user"]))
+            <h3>شاشة المراقبة التوعوية</h3>
+            <div class="terminal">
+[ SYSTEM ] Simulation started...
+[ WIFI ] STC_WiFi_5G
+[ DEVICE ] Mobile / Tablet (Simulated)
+[ LOCATION ] Makkah - Al-Akishiyah (Simulated)
+[ DNS ] 8.8.8.8
+[ STATUS ] Waiting for educational input...
+[ ALERT ] لا تدخل بياناتك في أي صفحة قبل التحقق من الرابط الرسمي.
+            </div>
 
-
-@app.route("/phishing-result")
-@login_required
-def phishing_result():
-    fake_user = session.get("last_fake_user", "غير معروف")
-    strength_level = session.get("last_password_strength", "غير معروف")
-
-    content = f"""
-    <section class="panel">
-        <h2>🚨 نتيجة التجربة</h2>
-        <div class="msg danger">
-            لقد أدخلت بياناتك في صفحة مشابهة لصفحات التصيد الاحتيالي.
-        </div>
-        <p class="sub">
-            في الواقع، كان من الممكن أن تُجمع هذه المعلومات لاستهداف حسابك أو إعادة استخدام كلمة المرور في مواقع أخرى.
-        </p>
-    </section>
-
-    <section class="grid">
-        <div class="card">
-            <h3>البيانات التي أدخلتها</h3>
-            <p><strong>اسم المستخدم:</strong> {fake_user}</p>
-            <p><strong>تم إدخال كلمة مرور:</strong> نعم</p>
-            <p><strong>الكلمة المعروضة:</strong> مخفية للحماية</p>
+            <div class="card" style="margin-top:14px;">
+                <h3>تحذير</h3>
+                <p>الصفحات المزيفة قد تكون مشابهة جدًا للحقيقية من حيث التصميم والشعار والألوان.</p>
+                <p>تحقق دائمًا من اسم الموقع، القفل، والنطاق الصحيح.</p>
+            </div>
         </div>
 
         <div class="card">
-            <h3>تحليل كلمة المرور</h3>
-            <p><strong>التقييم:</strong> {strength_level}</p>
+            <h3>المستشار الذكي</h3>
+            <p><b>س:</b> كيف أعرف أن الصفحة مزيفة؟</p>
+            <p><b>ج:</b> راقب اسم النطاق، والأخطاء الإملائية، والرسائل المستعجلة، وادخل يدويًا للموقع الرسمي.</p>
+            <hr>
+            <p><b>س:</b> هل يجوز إدخال كلمة المرور في أي رابط؟</p>
+            <p><b>ج:</b> لا، إلا إذا تأكدت من الموقع الرسمي 100٪.</p>
+            <hr>
+            <p><b>س:</b> ما أخطر شيء؟</p>
+            <p><b>ج:</b> مشاركة كلمة المرور أو رمز التحقق أو بيانات البطاقة في صفحات غير موثوقة.</p>
         </div>
-    </section>
+    </div>
 
-    <section class="panel">
-        <h3>كيف كان يمكنك اكتشاف الخطر؟</h3>
-        <ul class="list">
-            <li>الرسالة كانت مستعجلة وتضغط عليك للتصرف فورًا.</li>
-            <li>الرابط لم يكن من الموقع الرسمي الذي تصل إليه بنفسك.</li>
-            <li>الجهات الرسمية لا تطلب معلوماتك بهذه الطريقة.</li>
-            <li>يجب فتح الموقع الرسمي يدويًا بدل الضغط على الروابط.</li>
-        </ul>
-    </section>
-
-    <section class="panel">
-        <h3>ما التصرف الصحيح؟</h3>
-        <div class="msg success">
-            التصرف الصحيح هو تجاهل الرابط، ثم فتح الموقع الرسمي بنفسك أو التواصل مع الجهة مباشرة.
-        </div>
-        <div class="btns" style="margin-top:14px;">
-            <a class="btn btn-primary" href="/protection">العودة إلى صفحة الحماية</a>
-            <a class="btn btn-secondary" href="/dashboard">العودة للرئيسية</a>
-        </div>
-    </section>
+    {output}
     """
-    return render_template_string(base_page("نتيجة التصيد", content, session["user"]))
+    return render_page("مختبر التجارب", content)
 
 
 @app.route("/protection", methods=["GET", "POST"])
 @login_required
 def protection():
-    result_html = ""
-    password_value = ""
+    result = ""
 
     if request.method == "POST":
-        password_value = request.form.get("password", "")
-        result = evaluate_password(password_value)
-        notes = "".join([f"<li>{n}</li>" for n in result["notes"]])
-        result_html = f"""
-        <section class="panel">
-            <h3>نتيجة التحليل</h3>
-            <p class="sub"><strong>التقييم:</strong> <span class="badge {result["color"]}">{result["level"]}</span></p>
-            <p class="sub"><strong>الدرجة التقريبية:</strong> {result["score"]}</p>
-            <ul class="list">{notes}</ul>
-        </section>
+        password = request.form.get("password_to_check", "")
+        analysis = analyze_password_strength(password)
+        notes_html = "".join([f"<li>{n}</li>" for n in analysis["notes"]]) if analysis["notes"] else "<li>ممتاز، كلمة المرور جيدة</li>"
+
+        result = f"""
+        <div class="card">
+            <h3>نتيجة تحليل كلمة المرور</h3>
+            <p><b>التقييم:</b> <span style="color:{analysis["color"]};font-weight:bold;">{analysis["level"]}</span></p>
+            <p><b>الدرجة:</b> {analysis["score"]}</p>
+            <ul>{notes_html}</ul>
+        </div>
         """
 
-    img = svg_data_uri("🛡️", "الحماية الرقمية", "#00ff9c", "#00e0ff")
-
     content = f"""
-    <section class="panel">
-        <h2>🛡️ الحماية وفحص كلمة المرور</h2>
-        <p class="sub">قسم يجمع بين الإرشادات الأساسية والتجارب العملية التي تساعد المستخدم على اتخاذ القرار الصحيح.</p>
-    </section>
+    <div class="hero">
+        <h1>قسم الحماية</h1>
+        <p>اختبر قوة كلمة المرور وتعلم أهم خطوات الحماية العملية.</p>
+    </div>
 
-    <section class="grid">
-        <div class="card"><h3>عدم الثقة بالروابط</h3><p>لا تدخل بياناتك إلا في المواقع الرسمية التي تصل إليها بنفسك.</p></div>
-        <div class="card"><h3>تفعيل 2FA</h3><p>التحقق الثنائي يمنع كثيرًا من محاولات الاستيلاء على الحساب.</p></div>
-        <div class="card"><h3>التحديثات المستمرة</h3><p>حافظ على تحديث النظام والمتصفح والبرامج باستمرار.</p></div>
-    </section>
-
-    <section class="hero">
-        <div class="panel" style="margin-bottom:0;">
-            <h3>فاحص قوة كلمة المرور</h3>
-            <form method="POST" class="inline" style="margin-top:16px;">
-                <input type="text" name="password" placeholder="اكتب كلمة المرور للفحص" value="{password_value}">
-                <button class="btn btn-primary" type="submit">تحليل الكلمة</button>
-            </form>
-        </div>
+    <div class="split">
         <div class="card">
-            <img class="image-card" src="{img}" alt="الحماية">
+            <h3>تحليل كلمة المرور</h3>
+            <form method="post">
+                <label>أدخل كلمة المرور</label>
+                <input type="text" name="password_to_check" placeholder="اكتب كلمة المرور لتحليلها" required>
+                <button class="btn" type="submit">تحليل</button>
+            </form>
+            {result}
         </div>
-    </section>
 
-    {result_html}
-
-    <section class="panel">
-        <h3>تجربة تصيد تفاعلية</h3>
-        <p class="sub">وصلتك رسالة: "تم تعليق حسابك البنكي، حدّث بياناتك فورًا عبر الرابط".</p>
-        <div class="btns">
-            <a class="btn btn-danger" href="/fake-bank">فتح الرابط</a>
-            <button class="btn btn-primary" onclick="alert('✅ أحسنت. التحقق من الجهة الرسمية هو التصرف الصحيح.')">تجاهل والتحقق الرسمي</button>
+        <div class="card">
+            <h3>نصائح أساسية</h3>
+            <ul>
+                <li>استخدم كلمة مرور طويلة وغير متوقعة.</li>
+                <li>فعّل التحقق بخطوتين.</li>
+                <li>لا تعيد استخدام نفس كلمة المرور.</li>
+                <li>لا تحفظ كلمات المرور في أماكن مكشوفة.</li>
+                <li>تأكد من تحديث النظام والمتصفح باستمرار.</li>
+            </ul>
         </div>
-    </section>
+    </div>
     """
-    return render_template_string(base_page("الحماية", content, session["user"]))
+    return render_page("الحماية", content)
 
 
 @app.route("/quiz", methods=["GET", "POST"])
@@ -1874,130 +1108,323 @@ def protection():
 def quiz():
     if request.method == "POST":
         score = 0
-        total = len(QUIZ_QUESTIONS)
+        result_blocks = []
 
-        for idx, item in enumerate(QUIZ_QUESTIONS):
-            ans = request.form.get(f"q{idx}")
-            if ans == item["answer"]:
+        for i, item in enumerate(QUIZ_QUESTIONS):
+            user_answer = request.form.get(f"q{i}", "")
+            correct = item["answer"]
+            if user_answer == correct:
                 score += 1
+                status = '<span class="badge safe">صحيحة</span>'
+            else:
+                status = '<span class="badge danger-badge">خاطئة</span>'
+
+            result_blocks.append(f"""
+                <div class="card">
+                    <h3>السؤال {i+1}</h3>
+                    <p>{item["q"]}</p>
+                    <p><b>إجابتك:</b> {user_answer if user_answer else "لم يتم الاختيار"} {status}</p>
+                    <p><b>الإجابة الصحيحة:</b> {correct}</p>
+                    <p><b>التوضيح:</b> {item["explain"]}</p>
+                </div>
+            """)
 
         conn = db()
-        conn.execute(
-            "INSERT INTO quiz_results (username, score, total) VALUES (?, ?, ?)",
-            (session["user"], score, total)
-        )
+        conn.execute("""
+            INSERT INTO quiz_results (user_id, score, total)
+            VALUES (?, ?, ?)
+        """, (session["user_id"], score, len(QUIZ_QUESTIONS)))
         conn.commit()
         conn.close()
 
-        if score == total:
-            message = "أحسنت! نتيجتك ممتازة جدًا في الوعي السيبراني."
-            cls = "success"
-        elif score >= 7:
-            message = "أحسنت، مستواك جيد جدًا وتحتاج فقط إلى صقل إضافي."
-            cls = "success"
-        elif score >= 5:
-            message = "نتيجتك جيدة، لكن ما زال لديك مجال واضح للتطوير."
-            cls = "warning"
-        else:
-            message = "تحتاج إلى مزيد من التوعية والمراجعة."
-            cls = "danger"
+        final_level = "ضعيف"
+        if score >= 5:
+            final_level = "ممتاز"
+        elif score >= 3:
+            final_level = "جيد"
 
         content = f"""
-        <section class="panel">
-            <h2>📝 النتيجة النهائية</h2>
-            <div class="score">{score} / {total}</div>
-            <div class="msg {cls}">{message}</div>
-            <a class="btn btn-primary" href="/quiz">إعادة الاختبار</a>
-        </section>
+        <div class="hero">
+            <h1>نتيجة الاختبار</h1>
+            <p>درجتك: <span class="badge safe">{score} / {len(QUIZ_QUESTIONS)}</span></p>
+            <p>التقييم العام: <span class="badge medium">{final_level}</span></p>
+            <a class="btn" href="{url_for('quiz')}">إعادة الاختبار</a>
+        </div>
+        {"".join(result_blocks)}
         """
-        return render_template_string(base_page("نتيجة الاختبار", content, session["user"]))
+        return render_page("نتيجة الاختبار", content)
 
-    question_blocks = ""
-    for idx, item in enumerate(QUIZ_QUESTIONS):
-        options_html = ""
-        for option in item["options"]:
-            options_html += f"""
-            <label class="option">
-                <input type="radio" name="q{idx}" value="{option}" required> {option}
+    questions_html = ""
+    for i, item in enumerate(QUIZ_QUESTIONS):
+        choices = ""
+        for choice in item["choices"]:
+            choices += f"""
+            <label style="display:block;margin:8px 0;">
+                <input type="radio" name="q{i}" value="{choice}" style="width:auto;margin-left:8px;"> {choice}
             </label>
             """
-        question_blocks += f"""
-        <div class="question">
-            <h3>{idx + 1}. {item["question"]}</h3>
-            {options_html}
-            <p class="small">💡 {item["explanation"]}</p>
+        questions_html += f"""
+        <div class="card">
+            <h3>السؤال {i+1}</h3>
+            <p>{item["q"]}</p>
+            {choices}
         </div>
         """
 
     content = f"""
-    <section class="panel">
-        <h2>📝 اختبار الوعي السيبراني</h2>
-        <form method="POST" style="margin-top:18px;">
-            {question_blocks}
-            <button class="btn btn-primary" type="submit">إنهاء الاختبار</button>
-        </form>
-    </section>
+    <div class="hero">
+        <h1>اختبار الأمن السيبراني</h1>
+        <p>أجب عن الأسئلة التالية ثم اعرض نتيجتك في النهاية.</p>
+    </div>
+
+    <form method="post">
+        {questions_html}
+        <br>
+        <button class="btn" type="submit">عرض النتيجة</button>
+    </form>
     """
-    return render_template_string(base_page("الاختبار", content, session["user"]))
+    return render_page("الاختبار", content)
 
 
 @app.route("/chatbot", methods=["GET", "POST"])
 @login_required
 def chatbot():
-    reply = ""
-    user_msg = ""
+    answer = ""
+    question = ""
 
     if request.method == "POST":
-        user_msg = request.form.get("message", "").strip()
+        question = request.form.get("question", "").strip()
 
-        if user_msg in BOT_RESPONSES:
-            reply = BOT_RESPONSES[user_msg]
+        answer = "عذرًا، لم أفهم السؤال بشكل كامل. جرّب سؤالًا مثل: ما هو التصيد؟ أو كيف أحمي حسابي؟"
+        for key, value in CHATBOT_KNOWLEDGE.items():
+            if key in question or question in key:
+                answer = value
+                break
         else:
-            msg_lower = user_msg.lower()
-            if "واي فاي" in user_msg or "wifi" in msg_lower:
-                reply = "الشبكات العامة المفتوحة قد تكون خطرة. استخدم VPN ولا تدخل بيانات حساسة."
-            elif "كلمة مرور" in user_msg or "الباسورد" in user_msg:
-                reply = "استخدم كلمة مرور طويلة، متنوعة، ولا تكررها بين الحسابات."
-            elif "تصيد" in user_msg:
-                reply = "التصيد يعتمد على الخداع والاستعجال. تحقق من الرابط والجهة الرسمية دائمًا."
-            elif "التحقق الثنائي" in user_msg or "2fa" in msg_lower:
-                reply = "التحقق الثنائي من أقوى وسائل حماية الحسابات."
-            else:
-                reply = "أنا مساعد توعوي مخصص للأمن السيبراني. اسألني عن التصيد، الواي فاي، كلمات المرور، أو التحقق الثنائي."
+            # تحسين بسيط للأسئلة المتقاربة
+            q = question.replace("؟", "").strip().lower()
+            if "تصيد" in q:
+                answer = CHATBOT_KNOWLEDGE["ما هو التصيد"]
+            elif "واي" in q or "wifi" in q or "wi-fi" in q:
+                answer = CHATBOT_KNOWLEDGE["ما خطر الواي فاي المفتوح"]
+            elif "كلمة المرور" in q:
+                answer = CHATBOT_KNOWLEDGE["ما هي كلمة المرور القوية"]
+            elif "حسابي" in q or "احمي" in q:
+                answer = CHATBOT_KNOWLEDGE["كيف أحمي حسابي"]
 
-    suggested = "".join(
-        f"<button class='btn btn-secondary' type='submit' name='message' value='{q}' style='padding:10px 12px;'>{q}</button>"
-        for q in BOT_RESPONSES.keys()
-    )
-
-    chat_area = """
-    <div class="chat-box">
-        <div class="chat-msg bot">مرحبًا بك، أنا المساعد التوعوي للأمن السيبراني. اسألني ما تشاء.</div>
-    """
-    if user_msg:
-        chat_area += f"<div class='chat-msg user'>{user_msg}</div>"
-    if reply:
-        chat_area += f"<div class='chat-msg bot'>{reply}</div>"
-    chat_area += "</div>"
+    sample_questions = "".join([f"<li>{k}</li>" for k in CHATBOT_KNOWLEDGE.keys()])
 
     content = f"""
-    <section class="panel">
-        <h2>🤖 الشات بوت التوعوي</h2>
-        <p class="sub">اكتب سؤالك أو اختر من الأسئلة الجاهزة.</p>
-        {chat_area}
-        <form method="POST">
-            <div class="inline" style="margin-bottom:12px;">
-                <input type="text" name="message" placeholder="اكتب سؤالك هنا">
-                <button class="btn btn-primary" type="submit">إرسال</button>
-            </div>
-        </form>
-        <form method="POST" class="btns">
-            {suggested}
-        </form>
-    </section>
-    """
-    return render_template_string(base_page("الشات بوت", content, session["user"]))
+    <div class="hero">
+        <h1>المستشار الذكي</h1>
+        <p>اسأل عن الأمن السيبراني، التصيد، الروابط المشبوهة، كلمات المرور، والحماية.</p>
+    </div>
 
+    <div class="split">
+        <div class="card">
+            <form method="post">
+                <label>اكتب سؤالك</label>
+                <textarea name="question" placeholder="مثال: كيف أعرف الرابط المزيف؟">{question}</textarea>
+                <button class="btn" type="submit">إرسال السؤال</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3>الإجابة</h3>
+            <p>{answer if answer else "بانتظار سؤالك..."}</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>أسئلة مقترحة</h3>
+        <ul>{sample_questions}</ul>
+    </div>
+    """
+    return render_page("الشات بوت", content)
+
+
+# =========================================================
+# لوحة الأدمن
+# =========================================================
+@app.route("/admin")
+@login_required
+@admin_required
+def admin_panel():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) as c FROM users")
+    users_count = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) as c FROM quiz_results")
+    quizzes_count = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) as c FROM phishing_logs")
+    phishing_count = cur.fetchone()["c"]
+
+    cur.execute("SELECT * FROM users ORDER BY id DESC LIMIT 10")
+    users = cur.fetchall()
+
+    cur.execute("SELECT * FROM login_logs ORDER BY id DESC LIMIT 15")
+    logs = cur.fetchall()
+
+    cur.execute("""
+        SELECT p.*, u.username
+        FROM phishing_logs p
+        LEFT JOIN users u ON p.user_id = u.id
+        ORDER BY p.id DESC
+        LIMIT 10
+    """)
+    phishing_logs = cur.fetchall()
+
+    cur.execute("""
+        SELECT q.*, u.username
+        FROM quiz_results q
+        LEFT JOIN users u ON q.user_id = u.id
+        ORDER BY q.id DESC
+        LIMIT 10
+    """)
+    quiz_logs = cur.fetchall()
+
+    conn.close()
+
+    users_rows = ""
+    for u in users:
+        users_rows += f"""
+        <tr>
+            <td>{u["id"]}</td>
+            <td>{u["username"]}</td>
+            <td>{"نعم" if u["is_admin"] else "لا"}</td>
+            <td>{u["failed_attempts"]}</td>
+            <td>{"مقفول" if u["locked"] else "مفتوح"}</td>
+            <td>{u["created_at"]}</td>
+        </tr>
+        """
+
+    login_rows = ""
+    for l in logs:
+        login_rows += f"""
+        <tr>
+            <td>{l["username"]}</td>
+            <td>{"نجاح" if l["success"] else "فشل"}</td>
+            <td>{l["ip_address"]}</td>
+            <td>{l["user_agent"][:50]}...</td>
+            <td>{l["created_at"]}</td>
+        </tr>
+        """
+
+    phishing_rows = ""
+    for p in phishing_logs:
+        phishing_rows += f"""
+        <tr>
+            <td>{p["username"] if p["username"] else "غير معروف"}</td>
+            <td>{p["fake_username"]}</td>
+            <td>{p["password_strength"]}</td>
+            <td>{p["risk_level"]}</td>
+            <td>{p["created_at"]}</td>
+        </tr>
+        """
+
+    quiz_rows = ""
+    for q in quiz_logs:
+        quiz_rows += f"""
+        <tr>
+            <td>{q["username"] if q["username"] else "غير معروف"}</td>
+            <td>{q["score"]} / {q["total"]}</td>
+            <td>{q["created_at"]}</td>
+        </tr>
+        """
+
+    content = f"""
+    <div class="hero">
+        <h1>لوحة الأدمن</h1>
+        <p>إدارة ومتابعة الاستخدام داخل المشروع</p>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h3>عدد المستخدمين</h3>
+            <p style="font-size:28px;font-weight:bold;">{users_count}</p>
+        </div>
+        <div class="card">
+            <h3>عدد نتائج الاختبارات</h3>
+            <p style="font-size:28px;font-weight:bold;">{quizzes_count}</p>
+        </div>
+        <div class="card">
+            <h3>عدد سجلات التصيد</h3>
+            <p style="font-size:28px;font-weight:bold;">{phishing_count}</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>آخر المستخدمين</h3>
+        <table>
+            <tr>
+                <th>ID</th>
+                <th>اسم المستخدم</th>
+                <th>أدمن</th>
+                <th>محاولات فاشلة</th>
+                <th>الحالة</th>
+                <th>تاريخ الإنشاء</th>
+            </tr>
+            {users_rows}
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>آخر محاولات تسجيل الدخول</h3>
+        <table>
+            <tr>
+                <th>اسم المستخدم</th>
+                <th>النتيجة</th>
+                <th>IP</th>
+                <th>الجهاز</th>
+                <th>الوقت</th>
+            </tr>
+            {login_rows}
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>آخر سجلات محاكاة التصيد</h3>
+        <table>
+            <tr>
+                <th>المستخدم</th>
+                <th>الاسم المدخل</th>
+                <th>قوة كلمة المرور</th>
+                <th>الخطورة</th>
+                <th>الوقت</th>
+            </tr>
+            {phishing_rows}
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>آخر نتائج الاختبارات</h3>
+        <table>
+            <tr>
+                <th>المستخدم</th>
+                <th>الدرجة</th>
+                <th>الوقت</th>
+            </tr>
+            {quiz_rows}
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>بيانات الأدمن الحالية</h3>
+        <p><b>اسم المستخدم:</b> {ADMIN_USERNAME}</p>
+        <p><b>كلمة المرور:</b> {ADMIN_PASSWORD}</p>
+        <p class="danger-text">بعد نجاح التشغيل يفضل تغيير كلمة مرور الأدمن إلى كلمة أقوى.</p>
+    </div>
+    """
+    return render_page("لوحة الأدمن", content)
+
+
+# =========================================================
+# تشغيل التطبيق
+# =========================================================
+init_db()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
